@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.local/
+*.egg-info/
+.env
+*.sqlite3*
+build/
+dist/
+node_modules/
+*.tsbuildinfo
+.env.*
+!.env.example
