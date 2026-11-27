@@ -4,7 +4,7 @@
     "backend": {
       "root": ".",
       "framework": "fastapi",
-      "entrypoint": "backend.hosting:app",
+      "entrypoint": "pyproject.toml",
       "functions": {
         "backend/hosting.py": {
           "maxDuration": 300,
