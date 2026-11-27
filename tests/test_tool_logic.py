@@ -2,7 +2,6 @@
 import base64
 import copy
 import json
-import unittest
 from unittest.mock import patch
 
 from sqlalchemy import select
@@ -23,15 +22,7 @@ def submit(reference, comparable_ids=()):
                   "amount_conclusion": "SUPPORTED", "comparable_claim_ids": list(comparable_ids), "history_leads": []}}]}
 
 
-class ToolLogicTests(unittest.TestCase):
-    def setUp(self):
-        self.fixture = fixtures.AgenticTests()
-        self.fixture.setUp()
-        self.store = self.fixture.store
-
-    def tearDown(self):
-        self.fixture.tearDown()
-
+class ToolLogicTests(fixtures.AgenticFixtureTestCase):
     def completed_context(self):
         identifier, _ = self.fixture.run_claim()
         with self.store.session() as session:
@@ -89,16 +80,43 @@ class ToolLogicTests(unittest.TestCase):
             self.assertNotIn("fraud_initial", supplied["context"]["findings"])
             schema = next(t["input_schema"] for t in args[5] if t["name"] == "submit_analysis")
             self.assertIn(reference, schema["properties"]["evidence"]["items"]["enum"])
+            self.assertIn("submission:/gross_amount", schema["properties"]["evidence"]["items"]["enum"])
             self.assertNotIn(hidden, schema["properties"]["evidence"]["items"]["enum"])
             [source] = supplied["required_checks"]["supporting_evidence"]
-            return submit(reference, [row["id"] for row in source["result"]["records"]])
+            result = submit(reference, [row["id"] for row in source["result"]["records"]])
+            result["content"][0]["input"]["evidence"].append("submission:/gross_amount")
+            return result
         with patch.object(agentic, "call_model", side_effect=provider) as model:
             finding = agentic.run_specialist(self.store, identifier, context, 8, "historical", "Use saved coverage evidence")
         self.assertEqual(model.call_count, 1)
         self.assertEqual(finding["status"], "pass")
-        self.assertEqual(finding["evidence"], [reference])
+        self.assertEqual(finding["evidence"], [reference, "submission:/gross_amount"])
 
-    def test_hidden_other_claim_and_invented_references_remain_rejected(self):
+    def test_document_ids_cannot_break_history_or_create_fraud_leads(self):
+        identifier, context = self.completed_context()
+        reference, = context["findings"]["coverage"]["evidence"]
+
+        def provider(*args):
+            supplied = json.loads(args[4][0]["content"])
+            [source] = supplied["required_checks"]["supporting_evidence"]
+            records = source["result"]["records"]
+            schema = args[5][-1]["input_schema"]["properties"]
+            self.assertNotIn("history_leads", schema)
+            self.assertEqual(set(schema["comparable_claim_ids"]["items"]["enum"]), {row["id"] for row in records})
+            current_doc = supplied["submission"]["documents"][0]["id"]
+            result = submit(reference, [records[0]["id"], current_doc])
+            result["content"][0]["input"]["history_leads"] = [{"document_id": current_doc, "history_ids": [current_doc]}]
+            return result
+
+        with patch.object(agentic, "call_model", side_effect=provider):
+            finding = agentic.run_specialist(self.store, identifier, context, 8, "historical", "Compare costs")
+        details = finding["details"]
+        self.assertEqual(details["amount_justification"]["conclusion"], "REQUIRES_REVIEW")
+        self.assertEqual(details["fraud_investigation"]["leads"], [])
+        self.assertEqual(finding["status"], "review")
+        self.assertIn("Some cost comparison references did not match the retrieved claims.", details["review_reasons"])
+
+    def test_hidden_other_claim_and_invented_references_are_excluded_from_historical_findings(self):
         identifier, context = self.completed_context()
         prior_intake = set(context["findings"]["intake"]["details"]["sources"])
         hidden = next(ref for ref in context["findings"]["fraud_initial"]["details"]["sources"] if ref not in prior_intake)
@@ -114,8 +132,11 @@ class ToolLogicTests(unittest.TestCase):
                     self.assertNotIn(reference, schema["properties"]["evidence"]["items"]["enum"])
                     return submit(reference)
                 with patch.object(agentic, "call_model", side_effect=provider):
-                    with self.assertRaisesRegex(ValueError, "Citation was not retrieved"):
-                        agentic.run_specialist(self.store, identifier, supplied_context, number + 8, "historical", "Compare")
+                    finding = agentic.run_specialist(self.store, identifier, supplied_context, number + 8, "historical", "Compare")
+                self.assertEqual(finding["status"], "review")
+                self.assertNotIn(reference, finding["evidence"])
+                self.assertNotIn(reference, finding["details"]["analysis"]["evidence"])
+                self.assertIn("Some Historical citations could not be verified against the retrieved evidence.", finding["details"]["review_reasons"])
 
     def test_tampered_prior_evidence_stops_before_model(self):
         identifier, context = self.completed_context()

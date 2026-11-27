@@ -15,6 +15,7 @@ def execution_manifest():
     sources = {str(p.relative_to(root)).replace("\\", "/"): p.read_text(encoding="utf-8")
                for p in sorted(root.rglob("*.py"))}
     return {"python": platform.python_version(), "sources": sources, "source_hash": digest(sources),
-            "dependencies": {name: version(name) for name in ["langchain", "langgraph", "langfuse", "sqlalchemy", "fastapi", "pypdf", "sentence-transformers"]},
+            "dependencies": {name: version(name) for name in ["langchain", "langgraph", "langfuse", "sqlalchemy", "sqlite-vec",
+                             "fastapi", "pypdf", "httpx", "tiktoken", "tokenizers", "onnxruntime", "numpy"]},
             "mode": "anthropic-tools" if settings()[0] else "deterministic-tools",
             "model": settings()[1] if settings()[0] else None, "rules": "provisional-motor-v1"}

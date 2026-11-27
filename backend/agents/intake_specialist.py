@@ -5,9 +5,13 @@ from backend.claim_schemas import Finding
 from backend.evidence.required_claim_evidence import (
     COST_DOCUMENT_TYPES, SUPPORTING_DOCUMENT_LABELS, additional_charge_receipts, additional_charge_totals, has_police_report, required_gap,
 )
+from backend.evidence.synthetic_claim_text import TEXT_REF_PREFIX, available_text_refs, document_text_refs
+
+
 def cost_evidence(claim):
     documents = claim.get("documents") or []
-    document_type, name = COST_DOCUMENT_TYPES.get(claim.get("loss_type"), (None, None))
+    document_type, name = (("motor_benefit_receipt", "Itemised motor benefit receipt") if claim.get("motor_benefit")
+                           else COST_DOCUMENT_TYPES.get(claim.get("loss_type"), (None, None)))
     matching = [doc for doc in documents if document_type and doc.get("type") == document_type]
     return matching, document_type, name
 
@@ -27,6 +31,7 @@ def missing_cost_fields(claim):
             "vehicle_valuation": "The valuation is needed to establish the vehicle's value and assess the amount claimed under theft cover.",
             "repair_estimate": "An itemised estimate from the garage is needed to link the proposed repairs to the incident and assess the claimed repair cost.",
             "third_party_demand": "The itemised demand is needed to identify the third party and substantiate their claimed costs for the incident.",
+            "motor_benefit_receipt": "The itemised receipt is needed to substantiate the benefit expense and verify payment.",
         }
         return [required_gap(field, document_name, None, reasons[field])]
     required_fields = {
@@ -43,6 +48,9 @@ def missing_cost_fields(claim):
             ):
                 if not (document.get(key) or "").strip():
                     missing.append(required_gap(f"repair_estimate.{key}", name, label, reason))
+        if field == "motor_benefit_receipt" and document.get("payment_status") != "paid":
+            missing.append(required_gap("motor_benefit_receipt.payment_status", name, "Payment status",
+                                        "Provide a paid receipt or other payment confirmation for this reimbursement."))
         if not (document.get("registration") or "").strip():
             missing.append(required_gap("cost_document.registration", name, "Vehicle registration",
                                         "The registration links the cost document to the reported vehicle."))
@@ -64,13 +72,19 @@ def missing_cost_fields(claim):
 
 def investigate(tools):
     claim = tools["read_submission"].invoke({})
-    requirements = tools["read_coverage_requirements"].invoke({}) if claim.get("policy_id") else None
+    requirements = (tools["read_coverage_requirements"].invoke({})
+                    if claim.get("policy_id") or claim.get("source") == "Synthetic generator" else None)
     missing = []
     if not claim.get("loss_date"):
         missing.append(required_gap("loss_date", "Claim form", "Loss details / incident date",
                                     "A readable loss date is needed to determine the effective policy period."))
     typed_exclusion = requirements and requirements.get("typed_loss_excluded")
     cost_gaps = [] if typed_exclusion else missing_cost_fields(claim)
+    selected_policy = (requirements or {}).get("selected_policy")
+    deferred_cost_gaps = []
+    if selected_policy and not requirements.get("matched_cost_evidence_required"):
+        deferred_cost_gaps = cost_gaps
+        cost_gaps = []
     if requirements:
         charge_totals = additional_charge_totals(claim)
         for benefit in requirements.get("charge_receipt_requirements", []):
@@ -97,14 +111,14 @@ def investigate(tools):
         "currency": ("Claim currency", "The currency is needed to compare the amount claimed with the policy limit."),
     }
     for key, (label, reason) in required_fields.items():
+        if key == "policy_id" and selected_policy:
+            continue
         if claim.get(key) in (None, ""):
             missing.append(required_gap(key, "Claim form", label, reason))
-    if requirements and requirements["chassis_required"] and not (claim.get("vehicle") or {}).get("chassis_number"):
-        missing.append(required_gap("vehicle.chassis_number", "Claim form", "Vehicle details",
-                                    "The chassis number is needed to confirm the reported vehicle matches the vehicle identified in the policy."))
     internal_issue = None
     if requirements and not requirements["policy_available"]:
-        internal_issue = "Intake could not confirm a saved policy for the policy ID on the claim. Staff must resolve the policy reference before Coverage can start."
+        internal_issue = ("The selected policy PDF is unavailable for Coverage." if requirements.get("selected_policy") else
+                          "Intake could not confirm a saved policy for the policy ID on the claim. Staff must resolve the policy reference before Coverage can start.")
     elif requirements and requirements["missing_policy_terms"]:
         internal_issue = "The saved policy is missing terms needed for Coverage."
     elif requirements and not requirements["wording_ready"]:
@@ -116,7 +130,7 @@ def investigate(tools):
     missing_terms = set(requirements["missing_policy_terms"]) if requirements else set()
     checks = {
         "policy_period": policy_available and missing_terms.isdisjoint({"starts_on", "ends_before"}) and "loss_date" not in gaps,
-        "vehicle_match": policy_available and "registration" not in missing_terms and gaps.isdisjoint({"registration", "vehicle.chassis_number"}),
+        "vehicle_match": policy_available and "registration" not in missing_terms and "registration" not in gaps,
         "loss_and_costs": policy_available and requirements["wording_ready"]
         and claim.get("loss_type") in COST_DOCUMENT_TYPES
         and missing_terms.isdisjoint({"covered_losses", "limit", "deductible", "clause"})
@@ -125,17 +139,27 @@ def investigate(tools):
     }
     summary = f"Checked required fields in the claim form and {len(claim.get('documents') or [])} structured attachment(s)."
     evidence = ["submission:/narrative", "submission:/documents"]
+    text_evidence = ({"selected_policy": selected_policy, "deferred_cost_gaps": deferred_cost_gaps} if selected_policy else {})
+    if claim.get("unstructured_inputs"):
+        summary = f"Checked the claim form and fields extracted from {len(claim['documents'])} text attachment(s)."
+        refs = available_text_refs(claim)
+        evidence.extend(refs)
+        text_evidence.update(text_sources={key: "available" if TEXT_REF_PREFIX + key in refs else "absent"
+                                           for key in claim["unstructured_inputs"]}, document_text_refs=document_text_refs(claim))
     if requirements:
         evidence.append("tool:read_coverage_requirements")
         if policy_available:
-            summary += " Confirmed the submitted policy ID exists in the policy database."
+            summary += (" Confirmed the selected policy PDF is indexed." if requirements.get("selected_policy") else
+                        " Confirmed the submitted policy ID exists in the policy database.")
+        if selected_policy and selected_policy.get("document_kind") == "product_summary":
+            summary += " The selected PDF is a product summary. Coverage needs the full wording for a contract conclusion."
     if missing:
         summary += f" {len(missing)} document or field requirement(s) outstanding."
     if internal_issue:
         summary += " " + internal_issue
     return Finding(agent="intake", status="review" if internal_issue else "information" if missing else "pass",
                    summary=summary, evidence=evidence,
-                   details={"missing": missing, "coverage_readiness": {
+                   details={**text_evidence, "missing": missing, "coverage_readiness": {
                        "ready": all(checks.values()), "checks": checks, "internal_issue": internal_issue,
                        "policy_available": policy_available if requirements else None,
                    },

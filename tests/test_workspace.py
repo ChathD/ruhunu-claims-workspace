@@ -6,23 +6,28 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from pypdf import PdfWriter
 from sqlalchemy import select
 
 from backend.agents import coverage_specialist as coverage
 from backend.api import create_app
-from backend.storage.sqlite_store import AgentRun, Assessment, Claim, DecisionRecord, HumanTask, Store, ToolCall, digest
+from backend.storage.sqlite_store import Adjudication, AgentRun, Assessment, Claim, ClaimArchive, DecisionRecord, HumanTask, ModelInvocation, PolicyChunk, PolicyDocument, Store, ToolCall, digest
 from scripts.claim_fixtures import generate_batch
 from backend.claim_schemas import Route
 from backend.assurance.claim_audit_export import export_audit, verify_audit
 from backend.assurance.routing_evaluation import evaluate
 from backend.workflow.investigation_execution import execute_specialist
 from backend.workflow.routing_rules import select_route
+from backend.evidence import policy_wording_index as wording
 from backend.evidence.specialist_evidence_tools import build_tools
 from backend.workflow.claims_workflow import ClaimsWorkflow, UnsupportedWorkflowVersion
+from backend.workflow.selected_policy import generate_policy_schedule, queue_with_policy
+from legacy_claim_fixture import seed_legacy_claim
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -317,22 +322,81 @@ class WorkspaceTests(unittest.TestCase):
         self.assertFalse(report["complete"])
         with closing(sqlite3.connect(self.labels)) as connection, connection:
             connection.execute("UPDATE labels SET expected='adjuster review' WHERE assessment_id=?", (self.batch["assessment_ids"][0],))
+        self.run_claim(1)
         report = evaluate(self.store, self.labels)
-        self.assertEqual(report["matrix"][1][0], 1)
+        self.assertEqual(report["matrix"], [[1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])
         self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["class_metrics"], [
+            {"route": "auto_approval", "support": 1, "precision": 0.5, "recall": 1.0, "f1": 2 / 3},
+            {"route": "adjuster_review", "support": 1, "precision": None, "recall": 0.0, "f1": 0.0},
+            {"route": "need_information", "support": 0, "precision": None, "recall": None, "f1": None},
+            {"route": "fraud_escalation", "support": 0, "precision": None, "recall": None, "f1": None},
+        ])
 
 
 class ApiTests(unittest.TestCase):
+    def test_specialist_inputs_show_recorded_requests_and_offline_checks_to_staff(self):
+        self.app.state.worker.close()
+        identifier, _, _ = seed_legacy_claim(self.app.state.store, {
+            "policy_id": "TEST-POL", "registration": "ABC-1000", "loss_type": "glass", "loss_date": "2026-10-15",
+            "gross_amount": "100000.00", "narrative": "Synthetic claim for inspecting specialist input.", "attachments": []})
+        self.app.state.worker.workflow.run(identifier)
+        request = {"model": "fixture", "messages": [{"role": "user", "content": '{"context":{"findings":{"intake":{}}}}'}]}
+        with self.app.state.store.session.begin() as session:
+            session.add_all([
+                ModelInvocation(id="first", assessment_id=identifier, stage="r1:coverage", status="failed", payload=request),
+                ModelInvocation(id="second", assessment_id=identifier, stage="r1:coverage", status="complete", payload=request),
+                ModelInvocation(id="supervisor", assessment_id=identifier, stage="r1:supervisor", status="complete", payload=request),
+            ])
+        path = f"/api/claims/{identifier}/specialist-inputs"
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        stages = {stage["stage"]: stage for stage in response.json()["stages"]}
+        self.assertNotIn("r1:supervisor", stages)
+        self.assertTrue(stages["r0:intake"]["checks"])
+        self.assertEqual(stages["r0:intake"]["requests"], [])
+        self.assertEqual(stages["r1:coverage"]["requests"], [
+            {"id": "first", "status": "failed", "request": request},
+            {"id": "second", "status": "complete", "request": request},
+        ])
+        self.client.post("/api/auth/login", json={"email": "admin@ruhunu.local", "password": "AdminDemo!2026"})
+        self.assertEqual(self.client.get(path).status_code, 403)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="claims-api-")
         self.app = create_app(Path(self.tmp.name), auto_seed=False)
         self.client_context = TestClient(self.app)
         self.client = self.client_context.__enter__()
-        self.client.post("/api/auth/login", json={"email": "admin@ruhunu.local", "password": "AdminDemo!2026"})
+        self.client.post("/api/auth/login", json={"email": "staff@ruhunu.local", "password": "StaffDemo!2026"})
 
     def tearDown(self):
         self.client_context.__exit__(None, None, None)
         self.tmp.cleanup()
+
+    def test_routing_evaluation_requires_admin_and_handles_empty_workspace(self):
+        path = "/api/portal/evaluation"
+        self.assertEqual(self.client.get(path).status_code, 403)
+        self.assertEqual(self.client.get("/api/evaluation").status_code, 200)
+        self.client.post("/api/auth/logout")
+        self.assertEqual(self.client.get(path).status_code, 401)
+        self.client.post("/api/auth/login", json={"email": "admin@ruhunu.local", "password": "AdminDemo!2026"})
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, 200)
+        report = response.json()
+        self.assertEqual(report["matrix"], [[0] * 4 for _ in range(4)])
+        self.assertEqual((report["evaluated"], report["pending"], report["mismatches"]), (0, 0, 0))
+        self.assertEqual([row["f1"] for row in report["class_metrics"]], [None] * 4)
+
+    def test_account_creation_is_admin_only_and_creates_staff_only(self):
+        path = "/api/portal/accounts"
+        body = {"email": "new-staff@test.local", "password": "LongPassword2026"}
+        self.assertEqual(self.client.post(path, json=body).status_code, 403)
+        self.client.post("/api/auth/login", json={"email": "admin@ruhunu.local", "password": "AdminDemo!2026"})
+        self.assertEqual(self.client.post(path, json={**body, "role": "admin"}).status_code, 422)
+        response = self.client.post(path, json=body)
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["role"], "staff")
 
     def test_health_empty_dashboard_and_invalid_generation(self):
         self.assertEqual(self.client.get("/api/health").json()["environment"], "synthetic")
@@ -342,6 +406,102 @@ class ApiTests(unittest.TestCase):
         self.assertIsNone(summary["cost_per_claim"])
         self.assertEqual(self.client.post("/api/generator/preview", json={"count": 999}).status_code, 422)
         self.assertEqual(self.client.get("/api/claims/not-found").status_code, 404)
+
+    def test_staff_can_upload_preview_and_reindex_policy_pdf(self):
+        self.app.state.worker.close()
+        pdf = PdfWriter()
+        pdf.add_blank_page(width=612, height=792)
+        buffer = BytesIO()
+        pdf.write(buffer)
+        content = buffer.getvalue()
+        path = "/api/policy-documents"
+        body = {
+            "title": "Motor wording", "product": "MOTOR", "version": "2026.1",
+            "filename": "motor.pdf", "media_type": "application/pdf", "content": base64.b64encode(content).decode(),
+        }
+
+        uploaded = self.client.post(path, json=body)
+        self.assertEqual(uploaded.status_code, 202, uploaded.text)
+        identifier = uploaded.json()["id"]
+        [document] = self.client.get(path).json()["documents"]
+        self.assertEqual((document["id"], document["status"]), (identifier, "queued"))
+        self.assertEqual(self.client.get(f"{path}?selectable=true").json()["documents"], [])
+        preview_path = f"{path}/{identifier}/preview"
+        preview = self.client.get(preview_path)
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.headers["Content-Type"], "application/pdf")
+        self.assertEqual(preview.headers["Content-Disposition"], "inline")
+        self.assertEqual(preview.content, content)
+        self.assertEqual(self.client.get(f"{path}/{identifier}/original").content, content)
+        retry_path = f"{path}/{identifier}/retry"
+        self.assertEqual(self.client.post(retry_path).status_code, 409)
+        with self.app.state.store.session.begin() as session:
+            session.get(PolicyDocument, identifier).status = "ready"
+        [outdated] = self.client.get(path).json()["documents"]
+        self.assertTrue(outdated["requires_reindex"])
+        self.assertEqual(self.client.post(retry_path).status_code, 202)
+        self.assertEqual(self.client.get(f"{path}/{identifier}").json()["status"], "queued")
+        self.assertEqual(self.client.put("/api/policies/test/wording", json={"document_id": identifier}).status_code, 403)
+
+        self.client.post("/api/auth/logout")
+        self.assertEqual(self.client.post(path, json=body).status_code, 401)
+        self.assertEqual(self.client.get(preview_path).status_code, 401)
+        self.assertEqual(self.client.post(retry_path).status_code, 401)
+
+    def test_staff_can_remove_policy_from_picker_preserving_existing_claim_links(self):
+        self.app.state.worker.close()
+        store = self.app.state.store
+        content = b"%PDF-1.7\nSynthetic wording fixture"
+        identifier = wording.create_document(store, title="Motor wording", product="MOTOR", version="1",
+                                             filename="motor.pdf", media_type="application/pdf",
+                                             content=base64.b64encode(content).decode())
+        first, second = generate_batch(store, self.app.state.labels_path, count=2)["assessment_ids"]
+        with store.session.begin() as session:
+            document = session.get(PolicyDocument, identifier)
+            document.status = "ready"
+            document.embedding = {"model": wording.MODEL, "dimension": wording.DIMENSIONS,
+                                  "storage": wording.STORAGE, "chunk_format": wording.CHUNK_FORMAT}
+            session.add(PolicyChunk(id=f"{identifier}:{wording.CHUNK_FORMAT}:0", document_id=identifier, page=1,
+                                    text="Comprehensive cover includes collision damage."))
+            for assessment_id in (first, second):
+                session.get(Assessment, assessment_id).status = "awaiting_policy"
+        for assessment_id in (first, second):
+            generate_policy_schedule(store, assessment_id, identifier, "test")
+        self.assertEqual(queue_with_policy(store, first, identifier, "test"), "queued")
+
+        path = f"/api/policy-documents/{identifier}"
+        self.assertEqual(self.client.delete(path).status_code, 204)
+        self.assertEqual(self.client.delete(path).status_code, 204)
+        for listing in ("/api/policy-documents", "/api/policy-documents?selectable=true"):
+            self.assertEqual(self.client.get(listing).json()["documents"], [])
+        with self.assertRaisesRegex(ValueError, "current OpenAI passage index"):
+            queue_with_policy(store, second, identifier, "test")
+        self.assertEqual(self.client.get(f"/api/portal/claims/{first}").json()["selected_policy"]["id"], identifier)
+        self.assertEqual(self.client.get(f"{path}/preview").content, content)
+        self.client.post("/api/auth/logout")
+        self.assertEqual(self.client.delete(path).status_code, 401)
+
+    def test_archiving_claims_clears_active_lists_and_preserves_audits(self):
+        self.app.state.worker.close()
+        store = self.app.state.store
+        [identifier] = generate_batch(store, self.app.state.labels_path, count=1)["assessment_ids"]
+        with store.session.begin() as session:
+            assessment = session.get(Assessment, identifier)
+            assessment.status = "failed"
+            session.add(ClaimArchive(claim_id=assessment.claim_id))
+
+        self.assertEqual(self.client.get("/api/portal/claims?summary=true").json(), [])
+        self.assertEqual(self.client.get("/api/claims").json()["claims"], [])
+        path = f"/api/portal/claims/{identifier}"
+        detail = self.client.get(path).json()
+        self.assertTrue(detail["archived"])
+        self.assertFalse(detail["can_reprocess"])
+        self.assertEqual(self.client.post(f"{path}/retry").status_code, 409)
+        self.assertTrue(verify_audit(self.client.get(f"/api/claims/{identifier}/audit").json()))
+
+        [new_id] = generate_batch(store, self.app.state.labels_path, count=1)["assessment_ids"]
+        [active] = self.client.get("/api/portal/claims?summary=true").json()
+        self.assertEqual(active["id"], new_id)
 
     def test_retry_cannot_restart_a_retired_workflow(self):
         self.app.state.worker.close()
@@ -371,6 +531,8 @@ class ApiTests(unittest.TestCase):
         self.assertIsNone(detail["task"])
         self.assertTrue(detail["can_reprocess"])
         self.assertEqual(detail["processing_alerts"], ["Claim exceeds LKR 250,000"])
+        portal = self.client.get(f"/api/portal/claims/{previous}").json()
+        self.assertIsNone(portal["adjuster_review"])
         package = self.client.get(f"/api/claims/{previous}/audit").json()
         self.assertTrue(verify_audit(package))
         self.assertIsNone(package["decision"])
@@ -394,34 +556,63 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/claims/{previous}/audit").json()["replacement_assessment_id"], target)
         self.assertEqual(evaluate(store, self.app.state.labels_path)["evaluated"], 1)
 
-    def test_staff_retry_reuses_manual_submission_and_original_attachment(self):
+    def test_adjuster_summary_displays_only_priorities_selected_by_the_model(self):
         self.app.state.worker.close()
-        self.client.post("/api/auth/login", json={"email": "user@ruhunu.local", "password": "UserDemo!2026"})
+        store = self.app.state.store
+        claims = generate_batch(store, self.app.state.labels_path, 137, 16)["assessment_ids"]
+        identifier = claims[5]
+        issue = "The quotation lists an extra panel that the incident account does not mention."
+
+        def checks(*args):
+            finding = execute_specialist(*args)
+            if args[4] == "coverage":
+                finding["details"]["document_inconsistencies"] = [{"reason": issue, "document_refs": ["submission:/documents/0"]}]
+                finding["details"]["submitted_documents"] = {"submission:/documents/0": "Repair quotation"}
+            return finding
+
+        recommendation = {"route": Route.REVIEW.value, "explanation": "Gross amount exceeds authority.",
+                          "evidence": [], "outstanding_gaps": [], "adjuster_summary": [issue]}
+        with patch("backend.workflow.intake_first_graph.execute_specialist", side_effect=checks), patch(
+                "backend.workflow.intake_first_graph.recommend_route", return_value=recommendation):
+            self.app.state.worker.workflow.run(identifier)
+        response = self.client.get(f"/api/portal/claims/{identifier}")
+        self.assertEqual(response.status_code, 200, response.text)
+        detail = response.json()
+        self.assertEqual(detail["triage"]["reason_codes"], ["GROSS_AUTHORITY"])
+        self.assertEqual(detail["adjuster_review"], issue)
+        self.assertNotIn("adjuster_summary", detail["triage"]["recommendation"])
+        self.app.state.worker.workflow.run(claims[7])
+        below_threshold = self.client.get(f"/api/portal/claims/{claims[7]}").json()
+        self.assertEqual(below_threshold["triage"]["route"], Route.REVIEW.value)
+        self.assertEqual(below_threshold["status"], Route.REVIEW.value)
+        self.assertTrue(below_threshold["adjuster_review"])
+        self.app.state.worker.workflow.run(claims[2])
+        self.assertIsNone(self.client.get(f"/api/portal/claims/{claims[2]}").json()["adjuster_review"])
+
+    def test_failed_legacy_manual_case_preserves_attachments_and_audit(self):
+        self.app.state.worker.close()
+        store = self.app.state.store
         content = base64.b64encode(b"\x89PNG\r\n\x1a\nfictional fixture").decode()
         body = {"policy_id": "TEST", "registration": "ABC-1000", "loss_type": "repair", "loss_date": "2026-10-15",
                 "gross_amount": "100000.00", "narrative": "Synthetic windscreen claim.",
                 "attachments": [{"name": "estimate.png", "media_type": "image/png", "content": content}]}
-        previous = self.client.post("/api/portal/claims", json=body).json()["id"]
-        store = self.app.state.store
+        identifier, _, _ = seed_legacy_claim(store, body)
         with patch("backend.evidence.uploaded_claim_documents.prepare_attachments",
                    return_value=[{"status": "unavailable", "technical_failure": True}]):
-            self.app.state.worker.workflow.run(previous)
-        self.assertEqual(self.client.post(f"/api/portal/claims/{previous}/retry").status_code, 403)
-        [claim] = self.client.get("/api/portal/claims").json()
+            self.app.state.worker.workflow.run(identifier)
+        claim = self.client.get(f"/api/portal/claims/{identifier}").json()
         self.assertEqual(claim["status"], "investigation failed")
         self.assertFalse(claim["can_reprocess"])
-        self.client.post("/api/auth/login", json={"email": "staff@ruhunu.local", "password": "StaffDemo!2026"})
-        response = self.client.post(f"/api/portal/claims/{previous}/retry")
-        self.assertEqual(response.status_code, 202, response.text)
-        [claim] = self.client.get("/api/portal/claims").json()
-        self.assertEqual(claim["id"], response.json()["id"])
-        self.assertEqual(claim["submission"]["parent_assessment_id"], previous)
-        self.assertEqual(claim["submission"]["narrative"], body["narrative"])
+        self.assertEqual(self.client.post(f"/api/portal/claims/{identifier}/retry").status_code, 409)
+        self.assertEqual(self.client.post(f"/api/claims/{identifier}/retry").status_code, 409)
         [attachment] = claim["attachments"]
         self.assertEqual(self.client.get(f"/api/portal/attachments/{attachment['id']}").content, base64.b64decode(content))
-        with store.session() as session:
-            self.assertIsNone(session.get(DecisionRecord, previous))
-            self.assertNotIn("attachment_extraction", session.get(Assessment, claim["id"]).context)
+        report = self.client.get(f"/api/portal/claims/{identifier}/investigation.pdf")
+        self.assertEqual(report.status_code, 200)
+        self.assertTrue(report.content.startswith(b"%PDF-"))
+        review = {"outcome": "rejected", "reason": "Staff reviewed the archived evidence directly."}
+        self.assertEqual(self.client.post(f"/api/portal/claims/{identifier}/review", json=review).status_code, 404)
+        self.assertTrue(verify_audit(self.client.get(f"/api/claims/{identifier}/audit").json()))
 
     def test_legacy_failure_route_is_archived_and_claim_can_be_reprocessed(self):
         self.app.state.worker.close()
@@ -439,35 +630,22 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/claims/{previous}/audit").json()["decision"]["route"], "adjuster review")
         self.assertEqual(self.client.post(f"/api/claims/{previous}/retry").status_code, 202)
 
-    def test_roles_manual_submission_ownership_and_final_review(self):
-        self.client.post('/api/auth/logout')
-        self.assertEqual(self.client.get('/api/claims').status_code, 401)
-        self.client.post('/api/auth/login', json={'email': 'user@ruhunu.local', 'password': 'UserDemo!2026'})
-        self.assertEqual(self.client.get('/api/overview').status_code, 403)
-        self.assertEqual(self.client.post('/api/portal/accounts', json={'email':'bad@test.local','password':'LongPassword2026','role':'admin'}).status_code, 403)
-        body = {'policy_id': 'POL-MANUAL', 'registration': 'ABC-1234', 'loss_type': 'glass', 'loss_date':'2026-10-15',
-                'gross_amount':'300000.01', 'narrative':'The windscreen was damaged by a stone.', 'attachments':[]}
-        result = self.client.post('/api/portal/claims', json=body)
-        self.assertEqual(result.status_code, 201, result.text)
-        identifier = result.json()['id']
+    def test_customer_accounts_and_sessions_are_disabled(self):
         self.app.state.worker.close()
-        self.app.state.worker.workflow.run(identifier)
-        self.assertEqual(len(self.client.get('/api/portal/claims').json()), 1)
-        review = {'outcome':'rejected','reason':'The submitted policy does not cover this loss.'}
-        self.assertEqual(self.client.post(f'/api/portal/claims/{identifier}/review', json=review).status_code, 403)
-        self.client.post('/api/auth/register', json={'email':'other@test.local','password':'AnotherPassword2026','role':'admin'})
-        self.client.post('/api/auth/login', json={'email':'other@test.local','password':'AnotherPassword2026'})
-        self.assertEqual(self.client.get('/api/auth/me').json()['role'], 'user')
-        self.assertEqual(self.client.get('/api/portal/claims').json(), [])
-        self.client.post('/api/auth/login', json={'email':'staff@ruhunu.local','password':'StaffDemo!2026'})
-        self.assertEqual(self.client.post(f'/api/portal/claims/{identifier}/review', json={'outcome':'approved','reason':' ' * 12}).status_code, 422)
-        self.assertEqual(self.client.post(f'/api/portal/claims/{identifier}/review', json=review).status_code, 200)
-        self.assertEqual(self.client.post(f'/api/portal/claims/{identifier}/review', json=review).status_code, 409)
-        self.client.post('/api/auth/login', json={'email':'user@ruhunu.local','password':'UserDemo!2026'})
-        result = self.client.get('/api/portal/claims').json()[0]
-        self.assertEqual(result['status'], 'rejected')
-        self.assertEqual(result['reason'], review['reason'])
-        self.assertIsNone(result['triage'])
+        body = {"policy_id": "TEST", "registration": "ABC-1000", "loss_type": "repair", "loss_date": "2026-10-15",
+                "gross_amount": "100000.00", "narrative": "Synthetic windscreen claim."}
+        _, old_session, email = seed_legacy_claim(self.app.state.store, body)
+        self.client.post("/api/auth/logout")
+        self.client.cookies.set("claims_session", old_session)
+        self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+        self.assertEqual(self.client.get("/api/portal/claims").status_code, 401)
+        self.assertEqual(self.client.post("/api/auth/login", json={"email": email, "password": "LegacyCustomer!2026"}).status_code, 401)
+        self.client.cookies.clear()
+        self.client.post("/api/auth/login", json={"email": "admin@ruhunu.local", "password": "AdminDemo!2026"})
+        self.assertEqual(self.client.post("/api/auth/register", json={"email": "new@test.local", "password": "LongPassword2026"}).status_code, 404)
+        self.assertEqual(self.client.post("/api/portal/accounts", json={"email": "new@test.local", "password": "LongPassword2026", "role": "user"}).status_code, 422)
+        self.assertEqual({a["role"] for a in self.client.get("/api/portal/accounts").json()}, {"staff", "admin"})
+        self.assertEqual(self.client.post("/api/portal/claims", json=body).status_code, 405)
 
     def test_acknowledgement_requires_existing_pending_task_and_identity(self):
         batch = generate_batch(self.app.state.store, self.app.state.labels_path, 5, 16)
@@ -485,35 +663,47 @@ class ApiTests(unittest.TestCase):
         package = self.client.get(f"/api/claims/{batch['assessment_ids'][5]}/audit").json()
         self.assertEqual(package["human_actions"][0]["reviewer"], "Test reviewer")
 
-    def test_uploaded_evidence_permissions_and_approval_audit(self):
-        self.client.post('/api/auth/login', json={'email':'user@ruhunu.local','password':'UserDemo!2026'})
+    def test_archived_evidence_permissions_and_historical_approval_audit(self):
         content = b'%PDF-1.7\nSynthetic test fixture only'
         body = {'policy_id':'TEST-POL', 'registration':'ABC-1000', 'loss_type':'glass', 'loss_date':'2026-10-15',
                 'gross_amount':'100000.00', 'narrative':'Synthetic manual windscreen loss for testing.',
                 'attachments':[{'name':'evidence.pdf','media_type':'application/pdf','content':base64.b64encode(content).decode()}]}
-        result = self.client.post('/api/portal/claims', json=body)
-        self.assertEqual(result.status_code, 201, result.text)
-        identifier = result.json()['id']
         self.app.state.worker.close()
+        identifier, _, _ = seed_legacy_claim(self.app.state.store, body)
         self.app.state.worker.workflow.run(identifier)
         item = self.client.get('/api/portal/claims').json()[0]
-        self.assertEqual(item['status'], 'more information requested')
-        self.assertIsNone(item['triage'])
+        self.assertEqual(item['status'], 'request more information')
+        self.assertEqual(item['triage']['route'], 'request more information')
         [request] = item['information_required']
         self.assertEqual(request['document'], 'Itemised repair estimate')
         self.assertIn('assess the claimed repair cost', request['reason'])
         attachment = item['attachments'][0]['id']
         self.assertEqual(self.client.get(f'/api/portal/attachments/{attachment}').content, content)
-        self.client.post('/api/auth/register', json={'email':'stranger@test.local','password':'StrangerPassword2026'})
-        self.client.post('/api/auth/login', json={'email':'stranger@test.local','password':'StrangerPassword2026'})
-        self.assertEqual(self.client.get(f'/api/portal/attachments/{attachment}').status_code, 404)
-        self.client.post('/api/auth/login', json={'email':'staff@ruhunu.local','password':'StaffDemo!2026'})
-        self.assertEqual(self.client.post(f'/api/portal/claims/{identifier}/review', json={'outcome':'approved','reason':'The submitted evidence supports this claim.'}).status_code, 200)
-        self.client.post('/api/auth/login', json={'email':'admin@ruhunu.local','password':'AdminDemo!2026'})
+        self.assertEqual(self.client.get(f'/api/portal/claims/{identifier}').json()['reference'], item['reference'])
+        self.assertEqual(self.client.get(f'/api/portal/attachments/{attachment}').content, content)
+        self.assertEqual(self.client.get(f'/api/portal/claims/{identifier}').status_code, 200)
+        reviewer = self.client.get('/api/auth/me').json()['id']
+        with self.app.state.store.session.begin() as session:
+            session.add(Adjudication(assessment_id=identifier, reviewer_id=reviewer, outcome='approved',
+                                     reason='Historical staff approval preserved in the audit.'))
+        detail = self.client.get(f'/api/portal/claims/{identifier}').json()
+        self.assertEqual(detail['status'], 'request more information')
+        self.assertEqual(detail['information_required'], item['information_required'])
         audit = self.client.get(f'/api/claims/{identifier}/audit').json()
         self.assertEqual(audit['staff_decision']['outcome'], 'approved')
         self.assertEqual(audit['decision']['route'], 'request more information')
         self.assertTrue(verify_audit(audit))
+        self.client.post('/api/auth/login', json={'email':'admin@ruhunu.local','password':'AdminDemo!2026'})
+        for path in ('/api/portal/claims', f'/api/portal/claims/{identifier}', f'/api/portal/attachments/{attachment}',
+                     '/api/claims', f'/api/claims/{identifier}'):
+            self.assertEqual(self.client.get(path).status_code, 403, path)
+        self.assertEqual(self.client.post('/api/portal/claims', json=body).status_code, 405)
+        self.assertEqual(self.client.post(f'/api/claims/{identifier}/process', json={'policy_document_id': 'pdf-1'}).status_code, 403)
+        self.assertEqual(self.client.post('/api/generator/preview', json={'policy_id': 'TEST-POL', 'count': 1}).status_code, 403)
+        self.assertEqual(self.client.get('/api/portal/accounts').status_code, 200)
+        self.client.post('/api/auth/login', json={'email':'staff@ruhunu.local','password':'StaffDemo!2026'})
+        self.assertEqual(self.client.post('/api/portal/claims', json=body).status_code, 405)
+        self.assertEqual(self.client.post(f'/api/portal/claims/{identifier}/investigate').status_code, 404)
 
 
 if __name__ == "__main__":

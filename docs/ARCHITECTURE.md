@@ -5,16 +5,15 @@
 | Architecture component | Where to start |
 | --- | --- |
 | React-to-FastAPI boundary and SSE | [`api/workspace_api.py`](../backend/api/workspace_api.py) |
-| Accounts, manual claims and staff decisions | [`api/portal_routes.py`](../backend/api/portal_routes.py) |
+| Accounts and staff investigation views | [`api/portal_routes.py`](../backend/api/portal_routes.py) |
 | Policy document uploads and bindings | [`api/policy_document_routes.py`](../backend/api/policy_document_routes.py) |
-| Synthetic people, policies and wording | [`generation/synthetic_policy_generator.py`](../backend/generation/synthetic_policy_generator.py) |
-| Synthetic claim plans, previews and submission | [`generation/synthetic_claim_generator.py`](../backend/generation/synthetic_claim_generator.py), [`generation/claim_scenario_rules.py`](../backend/generation/claim_scenario_rules.py) |
+| Synthetic claims and PDF selection | [`generation/synthetic_claim_generator.py`](../backend/generation/synthetic_claim_generator.py), [`workflow/selected_policy.py`](../backend/workflow/selected_policy.py) |
 | Durable local jobs and checkpoints | [`workflow/investigation_worker.py`](../backend/workflow/investigation_worker.py), [`workflow/claims_workflow.py`](../backend/workflow/claims_workflow.py) |
 | Intake barrier, specialist dispatch, collector and judge | [`workflow/intake_first_graph.py`](../backend/workflow/intake_first_graph.py), [`workflow/specialist_readiness.py`](../backend/workflow/specialist_readiness.py), [`workflow/specialist_context.py`](../backend/workflow/specialist_context.py) |
 | Live Claude and offline specialist execution | [`workflow/investigation_execution.py`](../backend/workflow/investigation_execution.py), [`agents/claude_investigation.py`](../backend/agents/claude_investigation.py), [`agents/specialist_preflight.py`](../backend/agents/specialist_preflight.py) |
 | Anthropic streaming and model settings | [`agents/anthropic_stream.py`](../backend/agents/anthropic_stream.py), [`model_settings.py`](../backend/model_settings.py) |
 | Specialist logic | [Intake](../backend/agents/intake_specialist.py), [Coverage](../backend/agents/coverage_specialist.py), [Fraud](../backend/agents/fraud_specialist.py), [Historical](../backend/agents/historical_comparer.py) |
-| Scoped LangChain tools and evidence | [`evidence/specialist_evidence_tools.py`](../backend/evidence/specialist_evidence_tools.py), [claim history](../backend/evidence/approved_claim_history.py), [manual document extraction](../backend/evidence/uploaded_claim_documents.py), [policy wording RAG](../backend/evidence/policy_wording_index.py) |
+| Scoped LangChain tools and evidence | [`evidence/specialist_evidence_tools.py`](../backend/evidence/specialist_evidence_tools.py), [claim history](../backend/evidence/claim_history.py), [manual document extraction](../backend/evidence/uploaded_claim_documents.py), [policy wording RAG](../backend/evidence/policy_wording_index.py) |
 | Routing rules, publication and reprocessing | [`workflow/routing_rules.py`](../backend/workflow/routing_rules.py), [`workflow/claims_workflow.py`](../backend/workflow/claims_workflow.py), [`workflow/investigation_retry.py`](../backend/workflow/investigation_retry.py) |
 | SQLite store and shared types | [`storage/sqlite_store.py`](../backend/storage/sqlite_store.py), [`claim_schemas.py`](../backend/claim_schemas.py) |
 | Audit, investigation, Langfuse and confusion matrix | [audit export](../backend/assurance/claim_audit_export.py), [source provenance](../backend/assurance/execution_manifest.py), [investigation display](../backend/assurance/investigation_display.py), [Langfuse adapter](../backend/assurance/investigation_tracing.py), [evaluation](../backend/assurance/routing_evaluation.py) |
@@ -25,11 +24,12 @@ the assurance package exposes the stored evidence behind it.
 
 There are five logical agents: the orchestrator, Intake, Coverage, Historical Comparer and Fraud. The same Fraud specialist can run twice, with different instructions and tool access.
 
-## One execution graph
+## Versioned Intake-first graph
 
-All new generated and manual assessments are stamped `claude-intake-first-v3`.
-`backend/workflow/claims_workflow.py` hosts checkpoints and guarded publication;
-`backend/workflow/intake_first_graph.py` owns the only LangGraph graph.
+`backend/workflow/claims_workflow.py` chooses the graph by the assessment's
+recorded version. Both v3 and the selected-PDF v4 pilot use the same LangGraph
+builder and collector. The v4 graph adds a verification node between specialist
+execution and collection. Each version has its own checkpoint namespace.
 
 Intake must finish and commit before readiness. Claude assesses Coverage, Fraud
 and Historical separately with evidence references and precise owned gaps. Python
@@ -51,8 +51,9 @@ Historical returns a judgment about comparable costs, plus scoped cost-document 
 leads for independent verification. Fraud interprets verified evidence, records
 alternative explanations and raises additional concerns for adjuster review.
 Python retains exact policy, identity, arithmetic and publication controls.
-Only retrieved evidence can be cited. Limits are four dispatch rounds after Intake, four requests per specialist
-invocation, 40 model requests per claim and 15 minutes checked at dispatch/publication.
+Only retrieved evidence can be cited. Limits are four dispatch rounds after Intake, four standard turns per specialist
+invocation, 40 model requests per claim and 15 minutes checked at dispatch and publication. A specialist may repair an invalid
+submission once on the same turn. Coverage can also retry one truncated response with a larger output budget.
 
 Python's scoped check tools and Claude's model-facing tools are separate. Every
 specialist except Coverage can optionally `read_submission`. Coverage receives the
@@ -107,15 +108,18 @@ key does not change a stored model investigation into offline execution.
 The sequential graph, v2 supervisor graph and additive model investigation loop
 have been removed. Completed historical decisions and audits remain readable.
 Unfinished unsupported versions cannot resume or retry under different rules.
-Retired manual submissions without final adjudication can explicitly receive a
-new investigation revision, retaining original evidence and ownership. Synthetic
-fixtures can be regenerated. No database or checkpoint records are deleted.
+Queued legacy manual submissions continue on v3. Staff retain access to old
+attachments, audits and investigation decisions. New manual investigations and revisions
+are closed.
 
-Manual uploads are prepared before Intake. Cached extraction and derived document facts
-remain separate from the frozen submission. Staff retain final adjudication.
+Attachments on queued legacy manual assessments are prepared before Intake. Cached extraction and derived document facts
+remain separate from the frozen submission. Historical staff decisions remain readable in audit exports.
 The local audit stores a nested investigation trace, model request references and
-context transitions. Langfuse can export the same trace hierarchy and usage with
-opt-in payload capture for synthetic-only workspaces.
+context transitions. With export enabled, Langfuse receives trace hierarchies,
+operational summaries and provider token usage for investigations, synthetic claim
+previews, policy schedule generation and policy indexing. It can also receive text
+and structured payloads when `CLAIMS_LANGFUSE_CAPTURE_PAYLOADS=1`. The SQLite audit
+retains investigation evidence and model payloads.
 
 ```mermaid
 flowchart TD
@@ -133,11 +137,13 @@ See [Intake-first workflow](INTAKE_FIRST.md) and [debugging guide](DEBUGGING.md)
 
 ## Policy RAG
 
-Administrators upload immutable product wording as English UTF-8 TXT or text-based PDF, at most 10 MB. Indexing is a persisted job processed by the local worker. PDFs with unreadable pages require OCR. New manual assessments snapshot the IDs of uploaded document versions automatically. Generated assessments use the saved generated policy linked to the claim.
+Administrators upload policy PDFs up to 12 MiB. Indexing is a persisted job processed by the local worker. PDFium reads embedded text and the local OCR engine reads scanned pages. Legacy manual assessments use their frozen uploaded-document snapshot. Staff select an indexed PDF for each new synthetic assessment.
 
-Local CPU `all-MiniLM-L6-v2` embeddings are cached under `.local/models`. Chunks retain page numbers and contain 180 model tokens with 30-token overlap. Normalized vectors persist in the application SQLite database. For manual claims, retrieval computes cosine similarity across the uploaded document snapshot and returns up to five passages with document metadata. Coverage must cite applicable passages alongside structured policy checks.
+The OpenAI Embeddings API embeds extracted policy passages and queries with `text-embedding-3-small`. The `sqlite-vec` virtual table stores vectors partitioned by document ID. SQLite scores passages by cosine similarity plus the keyword boost for topic searches. The top ten candidates, taken across the frozen document scope, are reranked locally with the pinned `ms-marco-MiniLM-L6-v2` cross-encoder against the original query. The tool returns up to five and records its reranking status. A reranker failure returns the top five by the first-stage score.
 
-In manual claims, missing, unindexed or inapplicable wording leaves coverage unresolved and requires staff review. Completed assessments preserve their original sources for auditing.
+Chunks preserve exact page text and OCR provenance using 200 GPT-2 tokens and 40 tokens of overlap. Reindexing creates a new passage ID namespace, replaces the document's searchable vectors atomically and retains earlier passage rows for audit verification. Coverage can search the selected PDF by topic and retrieve a specific page to clarify tables or cross-references. For manual claims, retrieval searches the uploaded document snapshot and includes each result's document metadata.
+
+In legacy manual claims, missing, unindexed or inapplicable wording leaves coverage unresolved and requires staff review. Completed assessments preserve their original sources for auditing.
 
 ## Three different SQLite databases
 
@@ -147,13 +153,9 @@ In manual claims, missing, unindexed or inapplicable wording leaves coverage unr
 | `checkpoints.sqlite3` | LangGraph execution state and resume checkpoints | Workflow runtime |
 | `labels.sqlite3` | Generated scenarios, conditions, expected routes and batch identity | Generator and evaluator only |
 
-The people and policy generator saves fictional people, motor policies and their links in `people`, `policies` and `synthetic_policy_holders`. The claims generator reads the selected policy, unused scenario types and prior staff-approved synthetic cost evidence. Claude first plans a covered incident, itemised costs, required evidence and any comparable claim references. It then chooses a complete submission, a deliberate omission or a targeted coverage, cost or fraud test.
+Claude generates independent synthetic claims with fictional policy numbers. Commit creates an `awaiting_policy` assessment and stores ground truth in the separate labels database. Staff select an indexed PDF to queue the assessment. The queue transaction records the PDF ID, version and file hash, while the original claim retains its fictional policy number and submission hash.
 
-A second Claude request drafts the submission from the validated plan. For complete and omission scenarios, Python checks the draft against the policy and the plan, including the vehicle, period, documents and amounts. For an omission, Python removes the named item before reclassifying the final submission from its evidence. The preview shows the planned route using the available cost comparisons. Routing after submission uses the specialists' independent findings. The plan is saved in assessment execution metadata for audit, and expected routes are stored separately for evaluation. Specialist inputs contain the submitted claim evidence.
-
-Commit rechecks the person and policy link, the policy fingerprint from preview, remaining capacity and scenario uniqueness in a single write transaction. A policy allows ten saved synthetic claims across all batches. The submission carries the policy ID. Intake confirms the saved policy exists and receives only the evidence requirements needed for readiness. Coverage retrieves and snapshots the saved policy terms with its own audited tool, then assesses the submitted facts against those terms. Fixed fixtures are isolated to automated tests and scripted debugging.
-
-Policy generation saves Claude's full wording in `policy_documents` and links it through `policy_wording_bindings` in the same transaction as the schedule. Claim commit freezes the linked document ID. Coverage retrieves applicable excerpts only from that version and cites them per wording-based conclusion. For each cited difference, Claude explains its effect on eligibility, evidence requirements or payable and marks it material, immaterial or uncertain. The publication guard routes material and uncertain differences to adjuster review, subject to the existing fraud and missing-evidence priorities. Audit exports include the linked wording, retrieved passages and structured schedule used for the decision.
+Coverage retrieves passages only from the selected PDF and cites wording for supported conclusions and explicit evidence requirements. Product summaries support preliminary assessment. An adjuster verifies OCR-derived restrictions or document requests, the individual schedule and any payable amount. Audit exports include the original claim, selected PDF and retrieved passages. Archived assessments can still use their saved schedules and linked wording.
 
 The local worker resumes queued/processing assessments and document indexing jobs at startup. It uses one graph connection in one process. Specialist findings are unique by assessment and round-qualified stage; collected rounds and retries reuse committed findings. Checkpoint thread IDs use `intake-first:<assessment_id>`; retired checkpoint data is never executed. Decision publication recomputes the expected route from stored findings and creates a human task in the same transaction.
 
@@ -165,13 +167,13 @@ Rules are provisional fixtures awaiting the client's manual and authority defini
 
 Verified fraud indicators and high-severity Fraud findings with valid citations take precedence. The publication guard requests information when executed Intake or Coverage checks confirm that missing claimant evidence blocks a required assessment. Optional supporting evidence can be recorded for staff. This route creates an adjuster task for a gross claim above LKR 250,000. Otherwise duplicates, technical failures, coverage failures, valuation concerns and unresolved mandatory checks require review. Auto-approval is a provisional synthetic triage outcome. A routing correction to a published claim retains the original decision and records the transfer to the fraud queue.
 
-The workflow checks for eligible history after coverage is confirmed. The Historical specialist's `retrieve_comparable_claims` tool gathers narratives, cost documents and separately declared additional costs from distinct prior submissions in the same loss type and currency. Staff approval must precede the current submission. Claude selects claims with similar damage and work and assesses reasons for additional charges. Python audits the selected IDs and calculates statistics from reconciled itemised cost document totals. Five usable comparables are required to support the benchmark. With no eligible history, Historical is skipped. Offline checks require exact narrative and item-description matches and apply the provisional twice-median rule. Any additional charge needs human review in offline mode.
+The workflow checks for eligible history after coverage is confirmed. The Historical specialist's `retrieve_comparable_claims` tool gathers narratives, cost documents, published triage decisions and available staff decisions from distinct prior submissions in the same loss type and currency. The prior assessment must be complete with a triage decision published before the current submission. Claude selects genuinely similar incidents, explains how their outcomes inform the current assessment, and checks additional charges. Python audits the selected IDs and calculates statistics from any usable reconciled itemised cost totals. With no eligible history, Historical is skipped. Offline checks require exact narrative and item-description matches and apply the provisional twice-median rule. Any additional charge needs human review in offline mode.
 
 ## Audit and evaluation
 
 The audit download captures the original submission, original bound wording, exact tool responses and passages, model requests/responses and token usage, context snapshots, findings, instructions, rule version, dependency versions, backend source and human actions. `verify_audit` checks package consistency. Local hashes are not signatures and cannot protect against a person rewriting every hash. Six-month immutable retention is not operationally enforced here.
 
-The evaluator joins separate scenario labels with published predictions and emits an expected-row/predicted-column matrix. Pending predictions are explicitly counted and the report is marked partial. Labels never enter specialist tools or assessment context. The LLM labels assume no comparison history, and predictions can differ as approved claims accumulate.
+The evaluator joins separate scenario labels with published predictions and emits an expected-row/predicted-column matrix. Pending predictions are explicitly counted and the report is marked partial. Labels never enter specialist tools or assessment context. The LLM labels assume no comparison history, and predictions can differ as eligible prior claims accumulate.
 
 ## Production steps after this slice
 
@@ -179,7 +181,7 @@ The evaluator joins separate scenario labels with published predictions and emit
 - Replace provisional document, fraud and authority rules with client-approved configuration.
 - Move to PostgreSQL migrations, durable object storage and distributed worker leases.
 - Add authenticated reviewers, external delivery receipts and SLA escalation.
-- Add hard tool cancellation; the workflow checks the deadline before model/tool dispatch and at publication, but cannot interrupt a running local embedding operation.
+- Add hard tool cancellation for in-flight operations. The workflow checks the deadline before model and tool dispatch and at publication.
 - Meter OCR/model/hosting usage and source every unit price; no cost claim is fabricated.
 - Validate the 3,000-claim surge, region restrictions and retained-audit restoration.
 

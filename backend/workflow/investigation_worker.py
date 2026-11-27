@@ -4,7 +4,7 @@ import threading
 
 from sqlalchemy import select
 
-from backend.storage.sqlite_store import Assessment
+from backend.storage.sqlite_store import Assessment, ClaimArchive
 from backend.workflow.investigation_retry import mark_failed
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,10 @@ class Worker:
             from backend.evidence.policy_wording_index import index_pending
             index_pending(self.store)
             with self.store.session() as session:
-                pending = session.scalars(select(Assessment.id).where(Assessment.status.in_(["queued", "processing"]))).all()
+                pending = session.scalars(select(Assessment.id).where(
+                    Assessment.status.in_(["queued", "processing"]),
+                    Assessment.claim_id.not_in(select(ClaimArchive.claim_id)),
+                )).all()
             for identifier in pending:
                 if self.stop.is_set():
                     return

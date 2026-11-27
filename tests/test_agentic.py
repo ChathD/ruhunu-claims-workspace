@@ -8,34 +8,188 @@ from pathlib import Path
 import tempfile
 import unittest
 import httpx
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from sqlalchemy import select
 
-from backend.storage.sqlite_store import AgentRun, Assessment, Attachment, AttachmentExtraction, Claim, DecisionRecord, HumanTask, ModelInvocation, Policy, PolicyBinding, PolicyDocument, Store, ToolCall, digest
+from backend.storage.sqlite_store import AgentRun, Assessment, Attachment, AttachmentExtraction, Claim, DecisionRecord, History, HumanTask, ModelInvocation, Policy, PolicyBinding, PolicyChunk, PolicyDocument, Store, ToolCall, digest
 from scripts.claim_fixtures import generate_batch
 from scripts.debug_workflow import scripted_analysis_fields
 from backend.agents import claude_investigation as agentic
 from backend.assurance.claim_audit_export import export_audit, verify_audit
 from backend.assurance.investigation_display import display_finding
-from backend.evidence.policy_wording_index import create_document, index_document, search_document, search_uploaded_documents, uploaded_document_ids, ensure_synthetic_default
+from backend.evidence import policy_embeddings
+from backend.evidence.policy_wording_index import (CHUNK_FORMAT, CHUNK_TOKENS, create_document, ensure_synthetic_default, index_document,
+                                                  passage_tokenizer, search_document, search_uploaded_documents,
+                                                  token_passages, uploaded_document_ids)
+from backend.evidence.synthetic_claim_text import render_claim_text
 from backend.workflow.routing_rules import select_route
 from backend.workflow.fraud_route_correction import escalate_published_high_severity
 from backend.workflow.claims_workflow import ClaimsWorkflow
+from legacy_claim_fixture import seed_legacy_claim
 
 
-class Array(list):
-    def tolist(self):
-        return list(self)
+def fake_embeddings(texts):
+    return [[1.0] + [0.0] * (policy_embeddings.DIMENSIONS - 1) for _ in texts]
 
 
-class FakeEncoder:
-    tokenizer = SimpleNamespace(encode=lambda text, **kwargs: text.split(), decode=lambda tokens, **kwargs: " ".join(tokens))
-    def __getitem__(self, index):
-        return SimpleNamespace(auto_model=SimpleNamespace(config=SimpleNamespace(_commit_hash="test-revision")))
-    def encode(self, text, **kwargs):
-        return Array([[1.0, 0.0] for _ in text]) if isinstance(text, list) else Array([1.0, 0.0])
+def fake_reranking(query, passages):
+    return [0.0 for _ in passages]
+
+
+class PolicyEmbeddingTests(unittest.TestCase):
+    def test_token_passages_use_two_hundred_tokens_and_preserve_unicode(self):
+        tokenizer = passage_tokenizer()
+        text = "word" + " word" * 519
+        chunks = [tokenizer.encode_ordinary(passage) for passage in token_passages(text)]
+        self.assertEqual([len(chunk) for chunk in chunks], [200, 200, 200])
+        self.assertEqual(chunks[0][-40:], chunks[1][:40])
+        self.assertEqual(chunks[1][-40:], chunks[2][:40])
+        unicode_text = "日本語 සහ ශ්‍රී ලංකා\n" * 75 + "Final line."
+        passages = list(token_passages(unicode_text))
+        self.assertTrue(all(passage in unicode_text for passage in passages))
+        self.assertTrue(passages[-1].endswith("Final line."))
+
+    def test_token_passages_keep_table_rows_and_currency_amounts_intact(self):
+        for separator, amount in (("\n", "Rs. 5,000,000/-"), (" ", "Rs. 1 ,OOO.50")):
+            with self.subTest(amount=amount):
+                clause = f"Property liability limit is {amount} per event."
+                partial = separator + clause[:clause.index(",") + 3]
+                padding = " word" * (CHUNK_TOKENS - len(passage_tokenizer().encode_ordinary(partial)))
+                text = padding + separator + clause + " " + "more terms " * 60
+                passages = list(token_passages(text))
+                self.assertTrue(any(clause in passage for passage in passages))
+                self.assertTrue(all(amount in passage for passage in passages if "Rs." in passage))
+                if separator == "\n":
+                    self.assertNotIn("Property liability limit", passages[0])
+
+    def test_search_reranks_only_ten_candidates_and_returns_five(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = Store(Path(folder) / "claims.sqlite3")
+            try:
+                doc_ids = []
+                for words in ("collision " * 1000, "windscreen " * 2300):
+                    identifier = create_document(store, title="Wording", product="MOTOR", version="1", filename="terms.txt",
+                                                 media_type="text/plain", content=base64.b64encode(words.encode()).decode())
+                    with patch("backend.evidence.policy_wording_index.embed_texts", side_effect=fake_embeddings):
+                        index_document(store, identifier)
+                    doc_ids.append(identifier)
+
+                def ascending_scores(query, candidates):
+                    self.assertEqual(query, "policy question")
+                    self.assertEqual(len(candidates), 10)
+                    return list(range(10))
+
+                with patch("backend.evidence.policy_wording_index.embed_texts", side_effect=fake_embeddings) as embed, \
+                        patch("backend.evidence.policy_wording_index.rerank_scores", side_effect=ascending_scores) as score:
+                    result = search_document(store, doc_ids[1], "policy question", topic="claim_conditions")
+                    self.assertEqual(result["reranking"]["status"], "applied")
+                    self.assertEqual(len(result["passages"]), 5)
+                    self.assertEqual(result["passages"][0]["source"], f"chunk:{doc_ids[1]}:{CHUNK_FORMAT}:9")
+                    self.assertEqual(result["passages"][0]["rerank_score"], 9)
+                    embed.reset_mock()
+                    score.reset_mock()
+                    corpus = search_uploaded_documents(store, doc_ids, "policy question")
+                    embed.assert_called_once_with(["policy question"])
+                    score.assert_called_once()
+                    self.assertEqual(len(corpus["passages"]), 5)
+                    self.assertEqual({p["document_id"] for p in corpus["passages"]}, set(doc_ids))
+                    score.side_effect = RuntimeError("Fixture reranker failure")
+                    fallback = search_document(store, doc_ids[1], "policy question")
+                    self.assertEqual(fallback["reranking"]["status"], "fallback")
+                    self.assertEqual(fallback["passages"][0]["source"], f"chunk:{doc_ids[1]}:{CHUNK_FORMAT}:0")
+            finally:
+                store.engine.dispose()
+
+    def test_existing_openai_vectors_migrate_to_sqlite_vec_without_reembedding(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "claims.sqlite3"
+            store = Store(path)
+            wording = "A police report is required."
+            identifier = create_document(store, title="Terms", product="MOTOR", version="1", filename="terms.txt",
+                                         media_type="text/plain", content=base64.b64encode(wording.encode()).decode())
+            chunk_id = f"{identifier}:0"
+            [vector] = fake_embeddings([wording])
+            try:
+                with store.session.begin() as session:
+                    connection = session.connection()
+                    connection.exec_driver_sql("ALTER TABLE policy_chunks ADD COLUMN vector JSON NOT NULL DEFAULT '[]'")
+                    doc = session.get(PolicyDocument, identifier)
+                    doc.status = "ready"
+                    doc.embedding = {"model": policy_embeddings.MODEL, "dimension": policy_embeddings.DIMENSIONS}
+                    session.add(PolicyChunk(id=chunk_id, document_id=identifier, page=1, text=wording))
+                    session.flush()
+                    connection.exec_driver_sql("UPDATE policy_chunks SET vector = ? WHERE id = ?", (json.dumps(vector), chunk_id))
+            finally:
+                store.engine.dispose()
+
+            with patch("backend.evidence.policy_wording_index.embed_texts") as embed:
+                store = Store(path)
+                try:
+                    with store.engine.connect() as connection:
+                        self.assertNotIn("vector", [row.name for row in connection.exec_driver_sql("PRAGMA table_info(policy_chunks)")])
+                        length = connection.exec_driver_sql("SELECT vec_length(embedding) FROM policy_chunk_vectors WHERE chunk_id = ?",
+                                                            (chunk_id,)).scalar_one()
+                        self.assertEqual(length, policy_embeddings.DIMENSIONS)
+                    result = search_document(store, identifier, "police report", topic="claim_conditions",
+                                             query_embedding=lambda query: vector)
+                    self.assertEqual(result["embedding"]["storage"], "sqlite-vec")
+                    [passage] = result["passages"]
+                    self.assertEqual((passage["source"], passage["score"]), (f"chunk:{chunk_id}", 1.04))
+                    embed.assert_not_called()
+                finally:
+                    store.engine.dispose()
+
+    def test_openai_embedding_batches_restore_provider_index_order(self):
+        inputs = [f"passage {index}" for index in range(policy_embeddings.BATCH_SIZE + 1)]
+        batches = []
+
+        def respond(request):
+            self.assertEqual(str(request.url), policy_embeddings.ENDPOINT)
+            self.assertEqual(request.headers["Authorization"], "Bearer fixture-key")
+            body = json.loads(request.content)
+            self.assertEqual(body["model"], "text-embedding-3-small")
+            self.assertEqual(body["encoding_format"], "float")
+            batches.append(body["input"])
+            rows = [{"index": i, "embedding": [0.0] * i + [1.0] + [0.0] * (policy_embeddings.DIMENSIONS - i - 1)}
+                    for i, _ in enumerate(body["input"])]
+            return httpx.Response(200, json={"model": body["model"], "data": rows[::-1]})
+
+        client_class = httpx.Client
+
+        def client(**kwargs):
+            return client_class(transport=httpx.MockTransport(respond), **kwargs)
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "fixture-key"}), \
+                patch.object(httpx, "Client", side_effect=client):
+            vectors = policy_embeddings.embed_texts(inputs)
+        self.assertEqual(batches, [inputs[:-1], inputs[-1:]])
+        self.assertEqual([vector.index(1.0) for vector in vectors], [*range(policy_embeddings.BATCH_SIZE), 0])
+
+
+def text_pdf(text):
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=600, height=300)
+    font = DictionaryObject({NameObject('/Type'): NameObject('/Font'), NameObject('/Subtype'): NameObject('/Type1'), NameObject('/BaseFont'): NameObject('/Helvetica')})
+    page[NameObject('/Resources')] = DictionaryObject({NameObject('/Font'): DictionaryObject({NameObject('/F1'): writer._add_object(font)})})
+    content = DecodedStreamObject()
+    escaped = text.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
+    content.set_data(f'BT /F1 10 Tf 20 250 Td ({escaped}) Tj ET'.encode('ascii'))
+    page[NameObject('/Contents')] = writer._add_object(content)
+    stream = io.BytesIO()
+    writer.write(stream)
+    return stream.getvalue()
+
+
+class AgenticFixtureTestCase(unittest.TestCase):
+    def setUp(self):
+        self.fixture = AgenticTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        self.store = self.fixture.store
 
 
 class AgenticTests(unittest.TestCase):
@@ -46,14 +200,17 @@ class AgenticTests(unittest.TestCase):
         with patch.dict(os.environ, {'CLAIMS_LLM_MODE': 'deterministic'}):
             self.batch = generate_batch(self.store, self.root / 'labels.sqlite3', 137, 16)
         self.workflow = ClaimsWorkflow(self.store, self.root / 'checkpoints.sqlite3')
-        self.encoder_patch = patch('backend.evidence.policy_wording_index.encoder', return_value=FakeEncoder())
-        self.encoder_patch.start()
+        self.embedding_patch = patch('backend.evidence.policy_wording_index.embed_texts', side_effect=fake_embeddings)
+        self.embedding_patch.start()
+        self.reranker_patch = patch('backend.evidence.policy_wording_index.rerank_scores', side_effect=fake_reranking)
+        self.reranker_patch.start()
         self.document = self.upload('Only the bound policy glass wording. Deductible follows schedule.')
         index_document(self.store, self.document)
         self.selections = []
 
     def tearDown(self):
-        self.encoder_patch.stop()
+        self.reranker_patch.stop()
+        self.embedding_patch.stop()
         self.workflow.close()
         self.store.engine.dispose()
         self.tmp.cleanup()
@@ -251,7 +408,9 @@ class AgenticTests(unittest.TestCase):
                 self.assertIn("Cross-check every submitted document", args[3])
                 block["input"]["query"] = "drunk driving repair exclusion police report"
             else:
-                passage = f"chunk:{document}:0"
+                [wording] = json.loads(args[4][-1]["content"][0]["content"])["result"]["passages"]
+                self.assertIn(DRUNK_DRIVING_EXCLUSION, wording["text"])
+                passage = wording["source"]
                 block["input"].update(coverage_conclusion="NOT_COVERED", applicable_passages=[passage], policy_conflicts=[],
                     coverage_items=[{"item": "Repair damage", "outcome": "not_covered", "policy_term": DRUNK_DRIVING_EXCLUSION,
                         "reason": "The police recorded a positive alcohol test for the driver of the insured vehicle.",
@@ -267,6 +426,37 @@ class AgenticTests(unittest.TestCase):
         self.assertEqual(details["coverage_items"][0]["document_refs"], [police_ref])
         self.assertEqual(details["document_inconsistencies"][0]["document_refs"], [witness_ref, estimate_ref])
         self.assertEqual(len(details["submitted_documents"]), 3)
+
+    def test_coverage_can_cite_original_text_for_a_document_conflict(self):
+        identifier = self.prepare()
+        fnol = "submission:/unstructured_inputs/fnol_transcript"
+        estimate = "submission:/unstructured_inputs/repair_estimate_text"
+        with self.store.session.begin() as session:
+            claim = session.get(Claim, session.get(Assessment, identifier).claim_id)
+            payload = {**claim.payload, "narrative": "The front door was scratched. The windscreen was undamaged."}
+            document = {**payload["documents"][0], "id": "EST-SYN-1"}
+            document["line_items"] = [{"description": "Windscreen replacement", "amount": document["total"]}]
+            payload["documents"] = [document]
+            payload["unstructured_inputs"] = render_claim_text(payload, {"full_name": "Anjali Fernando"}, {}, 0)
+            claim.payload = payload
+            claim.payload_hash = digest(payload)
+
+        def provider(store, assessment_id, stage, instruction, messages, tools, choice):
+            supplied = json.loads(messages[0]["content"])
+            self.assertEqual(supplied["submitted_document_text_refs"], {"submission:/documents/0": estimate})
+            self.assertIn("Windscreen replacement", supplied["submission"]["unstructured_inputs"]["repair_estimate_text"])
+            self.assertNotIn("submission:/unstructured_inputs/medical_intake_note", str(tools[-1]["input_schema"]))
+            return {"content": [{"type": "tool_use", "name": "submit_analysis", "input": {
+                "summary": "The estimate lists a windscreen that the caller says was undamaged.",
+                "review_reasons": [], "evidence": [fnol, estimate], "coverage_conclusion": "UNRESOLVED", "coverage_items": [],
+                "document_inconsistencies": [{"reason": "The windscreen repair conflicts with the caller's damage description.",
+                                              "document_refs": [fnol, estimate]}],
+            }}]}
+
+        with patch.object(agentic, "call_model", side_effect=provider):
+            finding = agentic.run_specialist(self.store, identifier, {}, 1, "coverage", "Review the reported damage")
+        self.assertEqual(finding["details"]["coverage_status"], "UNRESOLVED")
+        self.assertEqual(finding["details"]["document_inconsistencies"][0]["document_refs"], [fnol, estimate])
 
     def test_model_policy_exclusion_stops_history_after_valid_date_preflight(self):
         identifier = self.prepare()
@@ -292,19 +482,40 @@ class AgenticTests(unittest.TestCase):
 
     def test_model_comparable_assessment_changes_the_route_without_hardcoded_threshold(self):
         identifier = self.prepare(10)
+        staff_reason = "The independent estimate supported the OEM parts and work."
+        assessment = "CLM-0999 supports comparable repair work and explains why OEM parts raise the amount on this claim."
+        with self.store.session.begin() as session:
+            current = session.get(Assessment, identifier)
+            prior = session.scalar(select(History).where(History.owner_claim_id == current.claim_id).order_by(History.id))
+            prior_id = prior.id
+            prior.payload = {**prior.payload, "claim_reference": "CLM-0999", "loss_date": "2026-09-01",
+                             "triage_decision": {"route": "adjuster review"},
+                             "staff_decision": {"outcome": "approved", "reason": staff_reason}}
+
         def provider(*args):
             response = self.provider(*args)
+            supplied = json.loads(args[4][0]['content'])
             if args[2].endswith(':historical'):
-                details = json.loads(args[4][0]['content'])['required_checks']['result']['details']
+                details = supplied['required_checks']['result']['details']
                 self.assertNotIn('amount_justification', details)
-                response['content'][0]['input'].update(amount_conclusion='SUPPORTED', summary='The evidence explains the higher amount.')
+                records = supplied['required_checks']['supporting_evidence'][0]['result']['records']
+                self.assertEqual(next(record for record in records if record['id'] == prior_id)['staff_decision']['reason'], staff_reason)
+                response['content'][0]['input'].update(amount_conclusion='SUPPORTED', summary=assessment, comparable_claim_ids=[prior_id])
+            elif args[2] == 'judge':
+                history = supplied['findings']['historical']['details']
+                self.assertEqual(history['review_assessment'], assessment)
+                self.assertEqual(history['review_history'][0]['staff_decision']['reason'], staff_reason)
+                response['content'][0]['input']['explanation'] = assessment
             return response
         with patch.object(agentic, 'call_model', side_effect=provider):
             self.workflow.run(identifier)
         with self.store.session() as session:
             history = session.get(Assessment, identifier).context['findings']['historical']['details']['amount_justification']
             self.assertEqual(history['conclusion'], 'SUPPORTED')
-            self.assertEqual(session.get(DecisionRecord, identifier).payload['route'], 'auto-approve')
+            self.assertEqual(history['sample_size'], 1)
+            decision = session.get(DecisionRecord, identifier).payload
+            self.assertEqual(decision['route'], 'auto-approve')
+            self.assertEqual(decision['recommendation']['explanation'], assessment)
 
     def test_unjustified_extra_cost_keeps_reconciled_claim_in_review(self):
         identifier = self.prepare(13)
@@ -551,14 +762,16 @@ class AgenticTests(unittest.TestCase):
         with patch.object(agentic, 'call_model', side_effect=provider):
             self.workflow.run(identifier)
         with self.store.session() as session:
-            details = session.get(Assessment, identifier).context['findings']['fraud_initial']
+            findings = session.get(Assessment, identifier).context['findings']
+            self.assertTrue(findings['intake']['details']['coverage_readiness']['checks']['vehicle_match'])
+            details = findings['fraud_initial']
             self.assertEqual(details['status'], 'pass')
             self.assertEqual(details['details']['fraud_concerns'], [])
             self.assertEqual(details['details']['plausibility']['assessment'], 'inconclusive')
             self.assertNotIn('suspicion', details['summary'])
             decision = session.get(DecisionRecord, identifier).payload
             self.assertEqual(decision['route'], 'request more information')
-            self.assertEqual({item['location'] for item in decision['information_required']}, {'Itemised charges', 'Vehicle details'})
+            self.assertEqual({item['location'] for item in decision['information_required']}, {'Itemised charges'})
             self.assertIsNone(session.scalar(select(HumanTask).filter_by(assessment_id=identifier)))
 
     def test_fraud_escalates_material_conflicting_excerpts_from_the_same_narrative(self):
@@ -673,6 +886,10 @@ class AgenticTests(unittest.TestCase):
     def test_truncated_final_coverage_turn_can_still_recover(self):
         identifier = self.prepare(manual=True)
         coverage_requests = []
+        policy_term = "The policy covers this loss subject to the applicable schedule and wording. " * 6
+        reason = "The vehicle, incident, and supporting documents establish the applicable cover and scope of the loss. " * 6
+        label = "Reported loss with repair work described in the itemised quotation and documented in the submitted evidence. " * 2
+        omission = "The wording does not address the separate storage charges incurred while the vehicle awaited assessment. " * 2
 
         def provider(*args, **kwargs):
             if args[2] != "r1:coverage":
@@ -686,20 +903,41 @@ class AgenticTests(unittest.TestCase):
             if turn == 4:
                 self.assertEqual(args[6], {"type": "tool", "name": "submit_analysis"})
                 raise agentic.ModelOutputTruncated("Final turn reached its output limit")
-            return self.provider(*args)
+            if turn == 6:
+                records = args[4]
+                [feedback] = records[-1]["content"]
+                self.assertTrue(feedback["is_error"])
+                self.assertEqual(json.loads(feedback["content"])["invalid_fields"][0]["path"], ["coverage_items", 0, "outcome"])
+                result = self.provider(*args[:4], records[:-2], *args[5:])
+            else:
+                result = self.provider(*args)
+            analysis = result["content"][0]["input"]
+            [item] = analysis["coverage_items"]
+            item.update(item=label, policy_term=policy_term, reason=reason)
+            analysis["policy_omissions"] = [{"item": omission, "impact": "The applicable amount remains uncertain."}]
+            if turn == 5:
+                item["outcome"] = "uncertain"
+            return result
 
         with patch.object(agentic, "call_model", side_effect=provider):
             self.workflow.run(identifier)
 
-        self.assertEqual(len(coverage_requests), 5)
-        (final_messages, _), (retry_messages, retry_options) = coverage_requests[-2:]
+        self.assertEqual(len(coverage_requests), 6)
+        (final_messages, _), (retry_messages, retry_options), (schema_messages, schema_options) = coverage_requests[-3:]
         self.assertEqual(final_messages, retry_messages)
         self.assertEqual(len(retry_messages), 7)
         self.assertEqual(retry_options["max_tokens"], 8192)
+        self.assertEqual(schema_messages[:-2], retry_messages)
+        self.assertEqual(schema_options["max_tokens"], 8192)
         with self.store.session() as session:
             details = session.get(Assessment, identifier).context["findings"]["coverage"]["details"]
             self.assertEqual(details["coverage_status"], "COVERED")
             self.assertNotIn("error_type", details)
+            [item] = details["analysis"]["coverage_items"]
+            self.assertEqual(item["item"], label.strip())
+            self.assertEqual(item["policy_term"], policy_term.strip())
+            self.assertEqual(item["reason"], reason.strip())
+            self.assertEqual(details["analysis"]["policy_omissions"][0]["item"], omission.strip())
 
     def test_incomplete_and_invalid_specialist_responses_recover_before_routing(self):
         identifier = self.prepare()
@@ -714,7 +952,10 @@ class AgenticTests(unittest.TestCase):
                 if coverage_attempts == 1:
                     raise agentic.IncompleteModelResponse("Model ended without submitting an analysis")
             if stage == "r1:fraud" and forced:
-                self.assertTrue(messages[-1]["content"][0]["is_error"])
+                feedback = messages[-1]["content"][0]
+                self.assertTrue(feedback["is_error"])
+                [issue] = json.loads(feedback["content"])["invalid_fields"]
+                self.assertEqual(issue["path"], ["fraud_concerns", 0, "reason"])
                 return self.provider(store, assessment, stage, instructions, messages[:1], tools, choice)
             response = self.provider(*args)
             if stage == "r1:fraud":
@@ -807,7 +1048,7 @@ class AgenticTests(unittest.TestCase):
             self.assertEqual(session.get(Assessment, identifier).context['wording_document_id'], self.document)
         self.assertEqual(search_document(self.store, None, 'policy')['status'], 'unavailable')
 
-    def test_scanned_pdf_requires_ocr_and_retry_can_index_txt(self):
+    def test_blank_policy_pdf_fails_when_ocr_cannot_read_it(self):
         from pypdf import PdfWriter
         stream = io.BytesIO()
         writer = PdfWriter()
@@ -819,7 +1060,7 @@ class AgenticTests(unittest.TestCase):
         with self.store.session() as session:
             doc = session.get(PolicyDocument, doc_id)
             self.assertEqual(doc.status, 'failed')
-            self.assertIn('OCR required', doc.error)
+            self.assertIn('OCR could not read policy page 1', doc.error)
 
     def test_fabricated_citations_are_rejected(self):
         identifier = self.prepare()
@@ -851,34 +1092,41 @@ class AgenticTests(unittest.TestCase):
                 app.state.worker.close()
                 self.assertEqual(client.get('/api/policy-documents').status_code, 401)
                 self.assertEqual(client.get('/api/policy-documents/example/preview').status_code, 401)
-                client.post('/api/auth/login', json={'email': 'user@ruhunu.local', 'password': 'UserDemo!2026'})
-                self.assertEqual(client.get('/api/policy-documents').status_code, 403)
-                self.assertEqual(client.get('/api/policy-documents/example/preview').status_code, 403)
                 client.post('/api/auth/login', json={'email': 'admin@ruhunu.local', 'password': 'AdminDemo!2026'})
-                body = {'title': 'Terms', 'product': 'MOTOR', 'version': '1', 'filename': 'terms.txt', 'media_type': 'text/plain',
-                        'content': base64.b64encode(b'Glass damage is covered subject to the schedule.').decode()}
+                body = {'title': 'Terms', 'product': 'MOTOR', 'version': '1', 'filename': 'terms.pdf', 'media_type': 'application/pdf',
+                        'content': base64.b64encode(text_pdf('Glass damage is covered subject to the schedule.')).decode()}
+                self.assertEqual(client.post('/api/policy-documents', json={**body, 'media_type': 'text/plain'}).status_code, 422)
                 response = client.post('/api/policy-documents', json=body)
                 self.assertEqual(response.status_code, 202, response.text)
                 doc_id = response.json()['id']
                 preview = client.get(f'/api/policy-documents/{doc_id}/preview')
                 self.assertEqual(preview.status_code, 200)
                 self.assertEqual(preview.content, base64.b64decode(body['content']))
-                self.assertTrue(preview.headers['content-type'].startswith('text/plain'))
+                self.assertTrue(preview.headers['content-type'].startswith('application/pdf'))
                 self.assertEqual(preview.headers['content-disposition'], 'inline')
+                self.assertEqual(preview.headers['x-content-type-options'], 'nosniff')
                 self.assertEqual(preview.headers['cache-control'], 'no-store')
+                self.assertEqual(preview.headers['content-security-policy'], "frame-ancestors 'self'")
                 self.assertEqual(client.get('/api/policy-documents/missing/preview').status_code, 404)
-                self.assertEqual(client.put('/api/generator/policy-wording', json={'document_id': doc_id}).status_code, 409)
+                self.assertEqual(client.get('/api/policy-documents?selectable=true').json()['documents'], [])
                 index_document(app.state.store, doc_id)
                 self.assertEqual(client.get(f'/api/policy-documents/{doc_id}').json()['status'], 'ready')
-                self.assertEqual(client.get(f'/api/policy-documents/{doc_id}/original').content, base64.b64decode(body['content']))
-                self.assertEqual(client.put('/api/generator/policy-wording', json={'document_id': doc_id}).status_code, 200)
+                original = client.get(f'/api/policy-documents/{doc_id}/original')
+                self.assertEqual(original.status_code, 200)
+                self.assertEqual(original.content, preview.content)
+                self.assertEqual(original.headers['content-type'], preview.headers['content-type'])
+                self.assertEqual(original.headers['content-disposition'], 'attachment; filename="policy-wording"')
+                self.assertEqual(original.headers['x-content-type-options'], 'nosniff')
+                self.assertNotIn('cache-control', original.headers)
+                self.assertNotIn('content-security-policy', original.headers)
+                self.assertEqual(client.get('/api/policy-documents/missing/original').status_code, 404)
                 generated = generate_batch(app.state.store, self.root / 'api-labels.sqlite3', 100, 1)
                 with app.state.store.session() as session:
                     assessment = session.get(Assessment, generated['assessment_ids'][0])
                     policy_id = session.get(Claim, assessment.claim_id).policy_id
                 self.assertEqual(client.put(f'/api/policies/{policy_id}/wording', json={'document_id': doc_id}).status_code, 200)
                 self.assertEqual(client.post(f'/api/policy-documents/{doc_id}/retry').status_code, 409)
-                self.assertEqual(client.get('/api/policy-documents').json()['generator_default'], doc_id)
+                self.assertEqual([doc['id'] for doc in client.get('/api/policy-documents?selectable=true').json()['documents']], [doc_id])
 
     def test_checkpoint_resumes_publication_without_repeating_specialists(self):
         identifier = self.prepare()
@@ -933,7 +1181,7 @@ class AgenticTests(unittest.TestCase):
 
     def test_failed_index_can_be_retried_without_changing_source(self):
         doc_id = self.upload('Glass policy wording')
-        with patch('backend.evidence.policy_wording_index.encoder', side_effect=OSError('model unavailable')):
+        with patch('backend.evidence.policy_wording_index.embed_texts', side_effect=policy_embeddings.PolicyEmbeddingError('model unavailable')):
             index_document(self.store, doc_id)
         with self.store.session() as session:
             doc = session.get(PolicyDocument, doc_id)
@@ -1069,7 +1317,10 @@ class AgenticTests(unittest.TestCase):
         self.assertIn("reduce the payable by LKR 40,000", package["decision"]["justification"])
         self.assertEqual(finding["details"]["coverage_status"], "UNRESOLVED")
         self.assertIsNone(finding["details"]["financial"]["payable"])
-        self.assertEqual(finding["details"]["policy_conflicts"][0]["passage_refs"], [f"chunk:{document}:0"])
+        lookup = next(call for call in package["retrievals"]
+                      if call["stage"] == "r1:coverage" and call["tool"] == "search_policy_documents")
+        [wording] = lookup["response"]["result"]["passages"]
+        self.assertEqual(finding["details"]["policy_conflicts"][0]["passage_refs"], [wording["source"]])
         self.assertEqual(package["policy_wording"]["id"], document)
         self.assertTrue(verify_audit(package))
 
@@ -1120,13 +1371,14 @@ class AgenticTests(unittest.TestCase):
             finding = agentic.run_specialist(self.store, identifier, context, 7, "coverage", "Check the exclusion for workshop work")
         self.assertEqual(model.call_count, 2)
         self.assertTrue(finding["details"]["policy_rag"]["cited"])
-        self.assertEqual(finding["details"]["coverage_items"][0]["passage_refs"], [f"chunk:{document}:0"])
         self.assertEqual(finding["details"]["submitted_documents"], {report_ref: "Incident report.json", witness_ref: "Witness statement.json"})
         with self.store.session() as session:
             submission = session.scalar(select(ToolCall).filter_by(assessment_id=identifier, stage="r7:coverage", tool="read_submission"))
             self.assertEqual(submission.response["documents"][2]["name"], finding["details"]["submitted_documents"][witness_ref])
             self.assertEqual(submission.response_hash, digest(submission.response))
             [lookup] = session.scalars(select(ToolCall).filter_by(assessment_id=identifier, stage="r7:coverage", tool="search_policy_documents")).all()
+            [wording] = lookup.response["result"]["passages"]
+            self.assertEqual(finding["details"]["coverage_items"][0]["passage_refs"], [wording["source"]])
             self.assertEqual(lookup.response["result"]["document_id"], document)
             self.assertIn("workshop servicing", lookup.request["query"])
 
@@ -1135,6 +1387,22 @@ class AgenticTests(unittest.TestCase):
         self.assertEqual(finding["status"], "review")
         self.assertEqual(finding["details"]["coverage_items"], [])
         self.assertIn("The submitted documents cited for Windscreen damage could not be verified.", finding["details"]["review_reasons"])
+
+    def test_manual_coverage_accepts_scanned_wording(self):
+        wording = "Windscreen damage from road debris is covered. Deductible follows schedule."
+        self.document = create_document(self.store, title="Scanned motor wording", product="MOTOR", version="1", filename="scan.pdf",
+            media_type="application/pdf", content=base64.b64encode(text_pdf(wording)).decode())
+        with patch("backend.evidence.policy_wording_index.extract_pdf_pages", return_value=([(1, wording)], [1])):
+            index_document(self.store, self.document)
+        identifier = self.prepare(manual=True)
+        with patch.object(agentic, "call_model", side_effect=self.provider):
+            self.workflow.run(identifier)
+        with self.store.session() as session:
+            details = session.get(Assessment, identifier).context["findings"]["coverage"]["details"]
+            self.assertEqual(details["coverage_status"], "COVERED")
+            self.assertTrue(details["policy_rag"]["cited"])
+            [retrieval] = details["policy_rag"]["retrievals"]
+            self.assertEqual(retrieval["passages"][0]["extraction"], "ocr")
 
     def test_irrelevant_uploaded_wording_requires_review(self):
         identifier = self.prepare(manual=True)
@@ -1168,7 +1436,7 @@ class AgenticTests(unittest.TestCase):
             self.assertIn('fraud_initial', context['findings'])
             self.assertEqual(session.get(DecisionRecord, identifier).payload['route'], 'adjuster review')
 
-    def test_manual_submission_queues_same_graph_and_preserves_original(self):
+    def test_existing_manual_queue_finishes_on_original_graph(self):
         from fastapi.testclient import TestClient
         from backend.api import create_app
         with patch.dict(os.environ, {'CLAIMS_LLM_MODE': 'deterministic'}):
@@ -1184,14 +1452,10 @@ class AgenticTests(unittest.TestCase):
                         'ends_before': '2027-01-01', 'covered_losses': ['glass'], 'limit': '200000.00',
                         'deductible': '10000.00', 'clause': 'MOTOR-1',
                     }))
-                client.post('/api/auth/login', json={'email': 'user@ruhunu.local', 'password': 'UserDemo!2026'})
                 body = {'policy_id': 'MANUAL-POL', 'registration': 'ABC-1234', 'loss_type': 'glass', 'loss_date': '2026-10-15',
                         'gross_amount': '100000.00', 'narrative': 'A stone cracked the windscreen.', 'attachments': [
                             {'name': 'estimate.png', 'media_type': 'image/png', 'content': base64.b64encode(b'\x89PNG\r\n\x1a\nsynthetic fixture').decode()}]}
-                with patch.dict(os.environ, {'CLAIMS_LLM_MODE': 'anthropic'}):
-                    response = client.post('/api/portal/claims', json=body)
-                self.assertEqual(response.status_code, 201, response.text)
-                identifier = response.json()['id']
+                identifier, _, _ = seed_legacy_claim(app.state.store, body, mode='anthropic-tools')
                 with app.state.store.session() as session:
                     assessment = session.get(Assessment, identifier)
                     original = copy.deepcopy(session.get(Claim, assessment.claim_id).payload)
@@ -1200,7 +1464,7 @@ class AgenticTests(unittest.TestCase):
                     self.assertIsNone(session.get(DecisionRecord, identifier))
                 client.post('/api/auth/login', json={'email': 'staff@ruhunu.local', 'password': 'StaffDemo!2026'})
                 review = {'outcome': 'approved', 'reason': 'Staff confirms the submitted evidence.'}
-                self.assertEqual(client.post(f'/api/portal/claims/{identifier}/review', json=review).status_code, 409)
+                self.assertEqual(client.post(f'/api/portal/claims/{identifier}/review', json=review).status_code, 404)
                 with patch.dict(os.environ, {'CLAIMS_LLM_MODE': 'anthropic'}), patch('backend.agents.claude_investigation.call_model', side_effect=self.provider) as mocked_calls:
                     app.state.worker.workflow.run(identifier)
                     app.state.worker.workflow.run(identifier)
@@ -1219,46 +1483,10 @@ class AgenticTests(unittest.TestCase):
                     self.assertEqual({run.stage for run in runs}, {'r0:intake', 'r1:coverage', 'r1:fraud'})
                     self.assertNotIn('historical', assessment.context['findings'])
                 item = client.get('/api/portal/claims').json()[0]
+                self.assertEqual(item['status'], 'adjuster review')
                 self.assertTrue(item['investigation']['tools'])
                 self.assertTrue(item['investigation']['plans'])
-                self.assertEqual(client.post(f'/api/portal/claims/{identifier}/review', json=review).status_code, 200)
-                client.post('/api/auth/login', json={'email': 'user@ruhunu.local', 'password': 'UserDemo!2026'})
-                item = client.get('/api/portal/claims').json()[0]
-                self.assertIsNone(item['investigation'])
-                self.assertIsNone(item['triage'])
-                self.assertEqual(item['findings'], {})
-
-    def test_old_manual_investigation_creates_idempotent_revision(self):
-        from fastapi.testclient import TestClient
-        from backend.api import create_app
-        from backend.storage.sqlite_store import Ownership, Account
-        with patch.dict(os.environ, {'CLAIMS_LLM_MODE': 'deterministic'}):
-            app = create_app(self.root / 'legacy-manual-api', auto_seed=False)
-            with TestClient(app) as client:
-                app.state.worker.close()
-                client.post('/api/auth/login', json={'email': 'user@ruhunu.local', 'password': 'UserDemo!2026'})
-                body = {'policy_id': 'OLD-POL', 'registration': 'OLD-1234', 'loss_type': 'glass', 'loss_date': '2026-10-15',
-                        'gross_amount': '100000.00', 'narrative': 'A stone cracked the windscreen.', 'attachments': []}
-                identifier = client.post('/api/portal/claims', json=body).json()['id']
-                with app.state.store.session.begin() as session:
-                    assessment = session.get(Assessment, identifier)
-                    assessment.status = 'complete'
-                    assessment.execution = {**assessment.execution, 'workflow': 'claude-supervisor-v2'}
-                    assessment.context = {**assessment.context, 'findings': {'intake': {'summary': 'Retained historical finding'}}}
-                    session.add(DecisionRecord(assessment_id=identifier, payload={'route': 'adjuster review', 'justification': 'Legacy manual review'}, payload_hash='legacy'))
-                self.assertEqual(client.post(f'/api/portal/claims/{identifier}/investigate').status_code, 403)
-                client.post('/api/auth/login', json={'email': 'staff@ruhunu.local', 'password': 'StaffDemo!2026'})
-                result = client.post(f'/api/portal/claims/{identifier}/investigate')
-                self.assertEqual(result.status_code, 202, result.text)
-                new_id = result.json()['id']
-                self.assertNotEqual(new_id, identifier)
-                self.assertEqual(client.post(f'/api/portal/claims/{identifier}/investigate').json()['id'], new_id)
-                self.assertEqual(client.post(f'/api/portal/claims/{identifier}/review', json={'outcome': 'approved', 'reason': 'A valid long review reason'}).status_code, 409)
-                with app.state.store.session() as session:
-                    self.assertIsNotNone(session.get(DecisionRecord, identifier))
-                    self.assertEqual(session.get(Assessment, identifier).context['findings']['intake']['summary'], 'Retained historical finding')
-                    self.assertEqual(session.get(Assessment, new_id).execution['workflow'], 'claude-intake-first-v3')
-                    self.assertEqual(session.get(Ownership, identifier).account_id, session.get(Ownership, new_id).account_id)
+                self.assertEqual(client.post(f'/api/portal/claims/{identifier}/review', json=review).status_code, 404)
 
     def test_manual_unreadable_document_records_failure_once(self):
         from backend.evidence.uploaded_claim_documents import prepare_attachments, effective_submission

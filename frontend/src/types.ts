@@ -176,13 +176,17 @@ export interface Overview {
   rules: string;
 }
 export interface Evaluation {
-  routes: Route[];
   matrix: number[][];
+  class_metrics: {
+    route: "auto_approval" | "adjuster_review" | "need_information" | "fraud_escalation";
+    support: number;
+    precision: number | null;
+    recall: number | null;
+    f1: number | null;
+  }[];
   evaluated: number;
   pending: number;
-  complete: boolean;
-  errors: { assessment_id: string; expected: Route; predicted: Route }[];
-  scope: string;
+  mismatches: number;
 }
 export interface ActivityEvent {
   id: number;

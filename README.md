@@ -1,15 +1,14 @@
 # Ruhunu Claims Workspace
 
-**Single Intake-first workflow:** all new assessments run mandatory Intake,
-then Claude assesses readiness separately for Coverage, Fraud and Historical.
-Python enforces the coverage gate and validates dispatch. See
-[the workflow walkthrough](docs/INTAKE_FIRST.md). Live Claude and offline adapters
-use this same graph. Retired workflow code has been removed; completed audit
-records remain available. Restart the backend to load source changes.
+**Intake-first investigations:** v3 is the default for newly processed claims. The
+selected-PDF v4 pilot adds typed planning and independent evidence verification
+before specialist findings enter routing. Both versions retain the investigation
+audit. See [the workflow walkthrough](docs/INTAKE_FIRST.md).
+Restart the backend after configuration or source changes.
 
-A standalone motor-claims triage project using **Python, FastAPI, LangChain tools, LangGraph, React, TypeScript and Tailwind**. The dashboard follows the agreed ivory-and-orange reference.
+A standalone Sri Lankan motor-claims triage project using **Python, FastAPI, LangChain tools, LangGraph, React and TypeScript**.
 
-This first working slice processes synthetic structured claim forms and JSON repair estimates and other cost documents. It includes all four routing outcomes, evolving context, specialist-owned retrieval, human tasks, a confusion matrix and portable audit exports.
+The workspace processes synthetic claim text and claimant-uploaded documents. It includes four routing outcomes, specialist-owned retrieval, human tasks, a confusion matrix and portable audit exports.
 
 ## Start locally
 
@@ -46,21 +45,24 @@ the backend directory only. Omit the flag for a fixed-code deployment; restart
 that server after deploying changes. Completed assessments retain their original
 decisions and do not rerun automatically after a restart.
 
-Start in **People & policies** and select **Generate and save**. Claude creates fictional people and one motor policy per person. In **Synthetic generator**, select a policy and preview up to its remaining capacity. Each policy allows ten saved synthetic claims, whether they are saved together or in successive batches. The generator checks each scenario type against the claim facts and rejects repeats across batches. Discarded previews leave capacity available. The background worker evaluates the submitted claims. Both generators need `ANTHROPIC_API_KEY` and use `ANTHROPIC_MODEL`.
+Sign in as staff and open **Policy schedule generator**. Select an indexed motor policy PDF, then generate one fictional Sri Lankan policy schedule at a time. The generator reads complete PDF pages in order and verifies cited lines before saving. It reads text-based PDFs and applies OCR to scanned wording, including ruled tables. A product summary (IPID) produces a provisional schedule with undisclosed terms left unspecified. Claims matched to a provisional schedule require the full wording and individual schedule to confirm coverage. Open **Claim generator** and select **Generate claim**. After saving, open the claim and choose **Process claim**. The system matches the reported policyholder and vehicle to the schedule and linked wording. Schedule and claim generation require `ANTHROPIC_API_KEY` and use `ANTHROPIC_MODEL`.
 
-For each scenario, Claude first plans a complete repair or theft claim against the selected policy, including the incident, covered costs and required evidence. A second request drafts the claim from that plan. For a deliberate omission, the backend validates the complete draft and then removes the selected item, such as a required police report. The preview shows the plan, the omission and the expected route. A complete claim is marked as an auto-approval candidate when its cost is supported by at least five comparable, staff-approved synthetic claims. Specialists determine the actual route after submission.
+The backend draws a route and a scenario supported by a saved policy schedule and its linked PDF version. It checks the benefit citation and any scenario-specific wording, such as a police report threshold or excluded vehicle use, before drafting. Claude receives those clauses alongside the scheduled terms and assigned facts. The backend checks the rendered evidence against the expected route. The evaluation labels record the decision reason, PDF version, policy citations and claim evidence. Intake extracts the submitted text and document fields for triage.
 
-Expected routes and scenario conditions are stored in the evaluation database. The LLM labels assume an empty comparison history, so actual routing may differ as eligible history grows.
+- **Auto-approval** covers routine minor damage, outpatient care under motor medical cover, theft of one scheduled fitted item, towing at the scheduled cap, and glass-only repair under an excess waiver.
+- **Adjuster review** covers shared liability, sublimits or depreciation, the boundary between prior and new damage, a severe loss near the policy limit, and conditional driver authorisation.
+- **Request more information** covers an unitemised invoice, an omitted mandatory police report, a missing vehicle identifier, a small discrepancy between the form and invoice totals, and missing proof of payment.
+- **Fraud escalation** covers an incident shown outside policy dates, a substituted vehicle registration, inflated severity and duplicate charges, concealed commercial use, and a cost document reused from a separate prior claim.
 
-Newly generated policies store the vehicle make, model, year and fictional chassis number. Repair terms specify eligible incidents and work, and labour and painting limits. They explicitly list covered and excluded additional charges, including a decision for towing, storage, diagnostic inspections and temporary transport. Each eligible charge has its own conditions, sublimit and receipt rule. Theft cover specifies whether it pays only the vehicle valuation or also includes named fittings. The generator also records which covered loss types require a police report. An absent report blocks assessment for an active policy that requires it. A repair estimate includes the garage name and address, vehicle registration, date and itemised proposed work. Receipts for additional charges are kept separate from the estimate total.
+On the claim page, open the linked motor policy schedule. When investigation results are available, open the report and choose **Download PDF** if you need a copy.
 
-Historical runs after coverage is confirmed and eligible claims exist. The `retrieve_comparable_claims` tool retrieves narratives and itemised cost documents from prior claims that staff approved before the current submission. Coverage checks that repair items fit the incident and assesses additional charges. The Historical specialist selects claims with similar damage and repairs and explains the comparison. Benchmarks use the selected itemised cost document totals. Claimants list each additional amount and its reason separately. With no eligible history, the workflow records the skip and routes otherwise approvable claims to an adjuster for amount validation.
+Ground truth is stored in the evaluation database. Use **Download evaluation files** after saving a claim or request `/api/generator/batches/{batch_id}/dataset.zip`. The archive contains linked JSON files for the schedule snapshots, submissions, attachments, and ground truth. Use `case_links.json` to join the observable inputs and `ground_truth.json` to score predictions. The JSON and CSV batch endpoints also remain available. The target route is an evaluation label. Live triage applies its own evidence and routing rules.
 
-When an earlier synthetic submission has a cost document for another vehicle, the generator can deliberately reuse that document in a new claim. Intake checks the exact copy against the frozen earlier submission, including the vehicle and incident identities. A verified match routes to Fraud escalation. The reviewer can assess whether the document was attached in error.
+Historical runs when eligible claims exist. The `retrieve_comparable_claims` tool retrieves narratives, itemised costs, published triage outcomes and any staff decisions recorded before the current submission. The Historical specialist selects similar incidents and explains how their decisions inform the current assessment. The report shows the selected cases and their outcomes. The benchmark uses any usable itemised costs from those cases. Coverage checks repair scope and separately claimed charges against the current policy and evidence. For a synthetic repair under a matched schedule with fixed terms, a fully reconciled itemised estimate and independent physical assessment can support provisional triage when no earlier claims are available.
 
 The backend loads the project-root `.env` when started with `python -m backend`. Set `ANTHROPIC_API_KEY` to enable the **Claude supervisor workflow** for new generated claims. `ANTHROPIC_MODEL` defaults to `claude-sonnet-4-6`; `CLAIMS_LLM_MODE=deterministic` selects offline checks on the same Intake-first graph. An assessment retains its stored execution mode; a missing API key never silently switches a model investigation to offline checks.
 
-Intake runs and commits first. Claude then assesses Coverage, Fraud and Historical readiness, and selects ready specialists. Historical waits for confirmed coverage; new historical leads can trigger one Fraud follow-up. Each specialist chooses its permitted LangChain tools. Python validates check results, wording citations, financial limits and verified fraud indicators before publishing. There are at most four dispatch rounds after Intake, four requests per specialist invocation and 40 model requests per claim. Coverage has a 3,200-token output limit per request. Other model requests have a 1,800-token limit. A specialist can retry once for incomplete output or a schema validation error within its request count. Scanned-image OCR remains unconnected.
+Intake runs and commits first. Claude then assesses Coverage, Fraud and Historical readiness, and selects ready specialists. Historical waits for confirmed coverage; new historical leads can trigger one Fraud follow-up. Each specialist chooses its permitted LangChain tools. Python validates check results, wording citations, financial limits and verified fraud indicators before publishing. There are at most four dispatch rounds after Intake, four standard turns per specialist invocation and 40 model requests per claim. Coverage starts with a 3,200-token output budget. A truncated Coverage response can retry once at 8,192 tokens. A specialist can make one additional request to correct schema errors, including on the final turn.
 
 ## Follow one claim
 
@@ -71,7 +73,9 @@ Intake runs and commits first. Claude then assesses Coverage, Fraud and Historic
 5. **Judge** recommends one route with evidence references and an explanation.
 6. **Publication guard** routes verified indicators and high-severity Fraud concerns based on conflicting, cited facts to the fraud team. It treats missing evidence as a completeness issue and requests it when executed checks identify a gap that blocks a required assessment. Each request names the missing item and the check it prevents. Gross LKR amounts above 250,000 create a human task even if the published route requests more information. Auto-approval is provisional synthetic triage.
 
-Open a claim's **Investigation** tab to see the model's accepted specialist assignments that produced findings, grouped by round. A blocked claim with no recorded model assignment shows its screening status and points to the Intake findings. The audit export includes dispatch records, tool calls and retrieved passages. **Decision** shows the recommendation and any publication override.
+For Claude investigations of third-party claims against a staff-selected PDF, Coverage records policy applicability and amount support for each claimed line, alongside a separate liability finding. Coverage commits claimant and internal evidence requests before the Judge runs. Publication uses the claimant requests independently of the Judge's recommendation. Find these records in `context.findings.coverage.details.third_party_assessment` in the audit JSON.
+
+Open a claim to see its documents, triage route and findings. **Audit JSON** includes specialist assignments, tool calls, retrieved passages and the published decision.
 
 Claude receives the exact policy, comparable and verification responses used by
 its mandatory checks in `required_checks.supporting_evidence`. These remain in
@@ -82,15 +86,17 @@ duplicate searches, structured-policy retrieval, comparable queries or verificat
 
 ## Upload policy wording
 
-Administrators can open **Policy documents** to upload English product wording as a text-based PDF or UTF-8 TXT, at most 10 MB. Every upload is an immutable version. Scanned/blank PDF pages fail with an OCR-required message. Indexing runs in the background; the page shows readiness, errors and retry controls.
+Staff and administrators can open **Policy wording** to upload a policy PDF up to 12 MiB and view uploaded versions. Each upload creates a version. The background indexer reads searchable text and runs local OCR on scanned pages, using Windows English OCR when available. The index records which passages came from OCR.
 
-Policy search uses local `sentence-transformers/all-MiniLM-L6-v2` CPU embeddings, downloaded into `.local/models` on first use. There is no embedding API key. Chunks use 180 model tokens with 30 overlap; normalized vectors persist in SQLite. Searches return up to five relevant passages across the assessment's uploaded document snapshot, with document, page and chunk citations.
+Set `OPENAI_API_KEY` in `.env` to index and search policy wording. The backend splits each page into 200 GPT-2 tokens with 40 tokens of overlap and embeds the passages using OpenAI `text-embedding-3-small`. The database returns 10 candidates using cosine similarity and a keyword boost for topic searches. A local MiniLM cross-encoder reranks them against the original query and returns the best five with page and passage citations. Selected-PDF v4 initially uses the best two per topic.
 
-Every newly generated synthetic policy includes a structured schedule and a separate wording document. The People & policies generator saves both together, links the wording to the policy, and queues it for indexing. A claim freezes that link at submission. Coverage uses the schedule for dates, vehicle identity, limits, deductibles and arithmetic. It searches the linked document for wording on eligibility, exclusions and evidence requirements. Findings show cited passages. Claude explains whether any difference could change this claim. Material or unresolved differences and unavailable applicable citations require adjuster review. Existing synthetic policies without a linked wording document continue to use their structured terms.
+For a PDF indexed with older passage boundaries, staff and administrators can open **Policy wording** and choose **Reindex with OpenAI**. Reindexing reads the original PDF and creates a new set of passage IDs. Earlier passages remain available for existing citations. The tokenizer and reranker assets are cached in `.local/models`. If the reranker cannot run, the tool records the fallback and returns the top five from SQLite's first-stage ranking.
 
-New manual assessments snapshot the uploaded document library. Claude searches that snapshot and assesses whether the cited wording applies. Generated wording stays out of that library. Completed assessments retain their original evidence references.
+For a new synthetic claim, the matched policy schedule and its linked PDF version are pinned when staff starts processing. Intake inventories the claim evidence and records cost gaps for Coverage to check after applicability. Coverage checks the schedule period and elected benefits, applies the linked wording and cites relevant pages. Indexed OCR and native PDF text use the same citation and applicability checks. Fraud checks contradictory assertions in the claim evidence and verified historical leads.
 
-Run `.\.venv\Scripts\python.exe scripts/validate-agentic.py` for a generated-claim smoke test in an isolated `.local/agentic-validation` database. Use `scripts/validate-manual.py` to exercise uploaded wording. Both use the Anthropic API and export an audit JSON.
+Queued legacy manual assessments finish on their saved v3 workflow and document snapshot. Staff can review completed legacy cases and download their original evidence.
+
+Run `.\.venv\Scripts\python.exe scripts/validate-agentic.py <policy-pdf>` for a generated-claim smoke test in an isolated `.local/agentic-validation` database. This command uses the Anthropic and OpenAI APIs and exports an audit JSON.
 
 ## Code map
 
@@ -98,8 +104,8 @@ The backend packages follow the [architecture diagram](docs/ruhunu-current-archi
 
 ```text
 backend/
-  api/                     FastAPI server, manual claims, staff review, SSE and policy uploads
-  generation/              Synthetic claims, people, policies and wording
+  api/                     FastAPI server, staff review, SSE and policy uploads
+  generation/              Synthetic claims and Claude generation client
   workflow/                LangGraph, readiness, context, decision routing and the worker
   agents/                  Intake, Coverage, Fraud and Historical specialists
   evidence/                LangChain tools, document extraction, policy RAG and claim history
@@ -108,12 +114,12 @@ backend/
   claim_schemas.py               Shared request, finding and decision types
   model_settings.py                Shared execution settings
 frontend/src/
-  pages/                  Overview, generator, evaluation and claim workspace
+  pages/                  Staff generator and policy wording management
   components.tsx          Reusable cards, tables and controls
-  App.tsx                 Navigation and remaining workspace screens
+  Portal.tsx              Sign-in, role navigation, claims and accounts
   api.ts                  HTTP client
   types.ts                Frontend contracts
-  styles.css              Reference-inspired responsive design
+  styles.css              Shared portal styles
 ```
 
 Use the [backend component map](docs/ARCHITECTURE.md#backend-component-map) to find the exact files for each part of the workflow.
@@ -132,9 +138,9 @@ Tests exercise actual graph execution, boundary amounts, human-task creation, co
 
 Application data lives in `.local/workspace/` by default:
 
-- `claims.sqlite3`: evidence, tool calls, findings, contexts, decisions and human actions.
-- `checkpoints.sqlite3`: LangGraph checkpoints.
-- `labels.sqlite3`: generator/evaluator labels, never exposed to specialist tools.
+Supabase mode stores submissions, evidence, evaluation labels, policy vectors, and LangGraph checkpoints in the private `ruhunu` Postgres schema. The backend uses `SUPABASE_DATABASE_URL`, a server-side Session pooler connection string with `sslmode=require`. It continues to handle browser authentication through the existing workspace API.
+
+To move an existing SQLite workspace, stop the backend and run `python scripts/migrate-to-supabase.py`. The importer reads the three SQLite databases under `.local/workspace`, verifies row counts, and copies the policy index and checkpoint history. Use `--source` for a different workspace directory. Set `CLAIMS_STORAGE=supabase` and restart once the import succeeds. The local development setting `CLAIMS_STORAGE=sqlite` uses the original SQLite files.
 
 Copy `.env.example` to `.env` and set your key locally. Never commit `.env`. `python -m backend` loads it without overriding shell variables. Direct ASGI launches use their process environment.
 
@@ -142,7 +148,20 @@ Copy `.env.example` to `.env` and set your key locally. Never commit `.env`. `py
 
 The audit export includes `trace.id`, the local span tree, and submission and workflow events. Each assessment has a stable trace ID across worker restarts. An investigation reprocess gets a new trace ID and shares its claim session ID with the original. Context collection shows the before and after versions and changed keys. Each model turn links to its exact system instructions, messages, tools, parameters and response by `model_invocation_id`. Prompt hashes identify instruction versions without requiring a hosted prompt registry. Retrieval and tool spans include arguments, results, timing and failures.
 
-Set `CLAIMS_ENABLE_LANGFUSE=1`, `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, and `LANGFUSE_SECRET_KEY` for your Langfuse project, then restart the backend. Submit a claim and look up its audit `trace.id` in Langfuse. Metadata export includes the span hierarchy, context fingerprints, tool names, errors and token use. Keep `CLAIMS_LANGFUSE_CAPTURE_CONTENT=0` for real data. Set it to `1` only when your workspace, linked wording and claim history are wholly fictional. Content export applies to generated claims in synthetic-only workspaces.
+1. Set `CLAIMS_ENABLE_LANGFUSE=1`, `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, and `LANGFUSE_SECRET_KEY` in `.env`. Copy the URL and keys from your Langfuse project's API Keys settings. `LANGFUSE_TRACING_ENVIRONMENT` and `LANGFUSE_RELEASE` let you filter by deployment.
+2. By default, Langfuse shows input and output summaries. For full text and structured payloads, set `CLAIMS_LANGFUSE_CAPTURE_PAYLOADS=1` in a workspace approved to send claim and policy data to Langfuse. This includes model prompts and responses, tool arguments and results, and retrieved passages. Binary attachments and embedding vectors are omitted. Restart the backend after changing `.env`.
+3. Run a new investigation, claim preview, policy schedule generation, or policy index job. In your Langfuse project's **Tracing** view, filter by `claim-investigation`, `generator-preview`, `generator-policy_schedules`, or `policy-index`. To find a specific investigation, use `trace.id` from **Export audit** on the staff claim.
+4. Open the trace and expand observations. Select an agent or tool to see its input, output, duration, and errors. Policy search shows query embedding, vector retrieval, and reranking when used. Select a Claude generation or OpenAI embedding to see the model and provider-reported tokens. Langfuse estimates USD cost from its model pricing when the model and usage match a pricing definition.
+
+### Final investigation correctness
+
+**Ruhunu Final Investigation Correctness** is the project's sole LLM judge. It uses GPT-6.2 Astra to read the **Input** and **Output** of the root `claims.investigation` observation. Its rule matches the investigation name, **Is Root Observation** and `metadata.final_evaluation:ready`. The backend adds the marker to a completed investigation when full payload capture is enabled and the recorded submission and Intake finding are available. The input includes the submitted claim and document evidence, the policy terms and retrievals, and the committed findings. The output contains the published triage decision. [Langfuse observation-level evaluations](https://langfuse.com/docs/evaluation/evaluation-methods/llm-as-a-judge#observation-evaluator-context)
+
+Open a completed investigation's root in **Tracing** and use **Preview** to inspect its input and output. **Scores** shows the evaluator's score from 0 to 1 and its explanation when the rule has run. A score of 1 means the disposition and rationale are correct and grounded. Fractional scores reflect partial correctness. To review individual model calls, expand their observations in the trace. The draft route appears in the `claims.route_recommendation` span and the local audit. The evaluator receives the published outcome.
+
+The app sends observations in batches and flushes at shutdown. To verify an isolated live investigation, run `python scripts/validate-agentic.py path/to/sample-policy.pdf` and look up the trace ID it prints in Langfuse's `verification` environment. In **Scores**, filter by **Ruhunu Final Investigation Correctness** and exclude `verification` to review live workflow verdicts.
+
+Open **Investigation → Specialist inputs** on a staff claim to inspect the saved model requests and recorded tool calls by round. On new Langfuse traces, the **claims.context.model_request** input lists the sections included in the request, the prior findings it received, and the number of policy passages included at the start.
 
 Set `CLAIMS_STREAM_MODEL=1` to stream Anthropic investigation responses. A generation remains open until the response completes or fails. The local audit retains text and usage received before a streaming failure. Buffered mode records the complete response and its usage.
 
@@ -154,24 +173,36 @@ This is a local, single-worker development slice, not the finished production de
 
 Mandatory documents, fraud rules, auto-approval eligibility and contracted processing region still require client confirmation. Current scenario rules are explicitly provisional.
 
-## Accounts, manual submission and staff decisions
+## Staff and admin access
 
-The workspace now requires sign-in. Local development accounts are:
+Local development accounts are:
 
 | Role | Email | Password |
 | --- | --- | --- |
-| User | user@ruhunu.local | UserDemo!2026 |
 | Staff | staff@ruhunu.local | StaffDemo!2026 |
 | Admin | admin@ruhunu.local | AdminDemo!2026 |
 
-These deliberately seeded demonstration credentials are for loopback development only. Do not expose the service publicly. Passwords are scrypt-hashed; browser sessions use expiring HttpOnly, SameSite cookies. Production still requires HTTPS, rate limiting, password recovery and managed account provisioning.
+Use these demonstration credentials on loopback only. Staff generate synthetic
+claims, upload, view, reindex and select policy PDFs, and review investigation findings and decisions.
+Administrators create staff accounts and can open **Routing evaluation** in the admin portal.
+Existing manual claim records, attachments and audits remain available to staff.
+Legacy customer accounts are inactive and remain linked to their historical records.
 
-Users can register their own account, submit claim details and up to five PDF/PNG/JPEG attachments (2 MB each), and track only their own claims. Additional costs have a separate amount and reason on the form. New manual submissions queue the same Claude supervisor/specialist/judge workflow as generated claims. PDF text is extracted locally. Claude extracts document facts from text and reads images or scanned PDFs using its native document and vision inputs. PDFs are limited to 20 pages each. Extracted document facts remain separate from the frozen submission. Every manual claim still needs a final authenticated staff decision.
+## Selected-PDF v4 pilot
 
-Staff can inspect claims, download evidence, and record approval or rejection with a mandatory meaningful reason. Staff cannot review their own submissions. A final decision is append-only and cannot be overwritten through the review endpoint. This records adjudication only; no payment occurs. AI triage remains independently preserved.
+Set `CLAIMS_SELECTED_PDF_WORKFLOW=v4` to opt new selected-PDF assessments into the
+pilot. The default is `v3`. Each queued run and subsequent retry uses the
+recorded workflow and selected PDF. The v4 staff detail shows the typed plan,
+verification results, and page links. The independent auditor runs only when
+the specialists propose evidence-dependent conclusions.
 
-Admins retain the original dashboard and synthetic generator, can use Claims & reviews, and can create accounts with user, staff or admin access. Ordinary registration cannot grant staff/admin access. The user's status page shows pending/processing, approved or rejected and the staff reason without exposing internal fraud findings or other users' records.
-
-New tables are added automatically to the local SQLite database; existing claim records are preserved. Production migration tooling remains a later deployment task.
-
-Staff and admins can use **Run investigation** on retired manual submissions without a final staff decision, including those with old findings. This creates an idempotent new investigation revision, copies ownership and attachments, preserves the original assessment and prevents adjudication of the superseded assessment. Claims & reviews separates model-assigned tasks from the audit evidence. Users see their claim status and requests for information. Run `python scripts/validate-manual.py` for an isolated synthetic live manual/PDF smoke test (incurs API usage).
+Run `scripts/evaluate-selected-pdf.py` with `--allianz`, `--fairfirst` and
+`--ipid` pointing to the three sample PDFs. The comparison runs 24 fixed pairs
+three times per version in isolated SQLite stores. Default runs exercise
+deterministic claim checks. Both modes use OpenAI for policy embeddings. Use
+`--export-labels` to export the draft answer key for review.
+Use `--live --labels <reviewed-answer-key.json>` to compare live Claude runs
+with the reviewed expectations. Record the reviewer in `reviewed_by`.
+The script reports release eligibility, route and evidence accuracy, safety
+checks, completion, model requests, tokens and elapsed time. The pilot may only
+become the default after it passes the live quality gate.

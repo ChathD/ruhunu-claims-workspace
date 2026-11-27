@@ -8,34 +8,43 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import func, select
 
-from backend.storage.sqlite_store import Adjudication, AgentRun, Assessment, Claim, DecisionRecord, FraudRoutingCorrection, HumanAction, HumanTask, InvestigationRevision, ModelInvocation, Store, ToolCall, WorkflowEvent, now
+from backend.storage.postgres import begin_write
+from backend.storage.sqlite_store import Adjudication, AgentRun, Assessment, Claim, ClaimArchive, DecisionRecord, FraudRoutingCorrection, HumanAction, HumanTask, InvestigationRevision, ModelInvocation, Store, SyntheticClaimPreview, ToolCall, WorkflowEvent, now
 from backend.generation.claude_generation_client import GenerationError
-from backend.generation.synthetic_claim_generator import POLICY_CLAIM_LIMIT, PolicySelectionError, claim_policies, commit_batch, preview_batch
-from backend.generation.synthetic_policy_generator import generate_people_policies, list_people_policies
-from backend.claim_schemas import AcknowledgeRequest, ClaimPreviewRequest, GenerateRequest, Route
+from backend.generation.scheduled_claim_generator import plan_scheduled_claims, preview_scheduled_batch
+from backend.generation.synthetic_claim_generator import commit_batch, commit_pending_preview
+from backend.claim_schemas import AcknowledgeRequest, ClaimPreviewRequest, Route
 from backend.assurance.claim_audit_export import export_audit
 from backend.assurance.routing_evaluation import evaluate
-from backend.assurance.investigation_display import completed_model_assignments, display_finding
+from backend.assurance.synthetic_dataset import dataset_csv, dataset_records, dataset_zip
+from backend.assurance.investigation_display import completed_model_assignments, display_finding, specialist_inputs, staff_justification
 from backend.assurance.investigation_tracing import flush_langfuse, trace_id_for
 from backend.workflow.investigation_retry import can_reprocess, failure_reason, interrupted_attention, queue_reprocessing
 from backend.workflow.investigation_worker import Worker
 from backend.workflow.claims_workflow import ClaimsWorkflow
+from backend.workflow.selected_policy import queue_with_matching_schedule
+from backend.workflow.versions import selected_pdf_workflow
 
 
-def create_app(data_dir=None, auto_seed=False):
+def create_app(data_dir=None, auto_seed=False, *, database_url=None):
+    if data_dir is None and os.getenv("CLAIMS_STORAGE") == "supabase":
+        database_url = database_url or os.getenv("SUPABASE_DATABASE_URL")
+        if not database_url:
+            raise ValueError("Set SUPABASE_DATABASE_URL for Supabase storage.")
     data_dir = Path(data_dir or os.getenv("CLAIMS_DATA_DIR", ".local/workspace"))
     data_dir.mkdir(parents=True, exist_ok=True)
-    store = Store(data_dir / "claims.sqlite3")
-    labels_path = data_dir / "labels.sqlite3"
+    store = Store(data_dir / "claims.sqlite3", database_url=database_url)
+    if database_url:
+        store.initialize_postgres()
+    labels_path = None if database_url else data_dir / "labels.sqlite3"
     generation_lock = threading.Lock()
-    policy_generation_lock = threading.Lock()
-    pending_previews = {}
-    discarded_incidents = deque(maxlen=24)
+    discarded_fixtures = deque(maxlen=24)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -44,12 +53,8 @@ def create_app(data_dir=None, auto_seed=False):
                 empty = session.scalar(select(func.count()).select_from(Claim)) == 0
             if empty:
                 batch_id = str(uuid.uuid4())
-                policies = list_people_policies(store)
-                if not policies:
-                    generate_people_policies(store, 16)
-                    policies = list_people_policies(store)
-                selected_policy = policies[0]["policy"]["policy_id"]
-                commit_batch(store, labels_path, batch_id, preview_batch(store, POLICY_CLAIM_LIMIT, batch_id, selected_policy))
+                plans = plan_scheduled_claims(store, 10)
+                commit_batch(store, labels_path, preview_scheduled_batch(plans, batch_id))
         workflow = ClaimsWorkflow(store, data_dir / "checkpoints.sqlite3")
         worker = Worker(store, workflow)
         app.state.worker = worker
@@ -72,7 +77,10 @@ def create_app(data_dir=None, auto_seed=False):
 
     def claim_rows(assessment_id=None):
         with store.session() as session:
-            claims = session.scalars(select(Claim).order_by(Claim.sequence.desc())).all()
+            query = select(Claim).order_by(Claim.sequence.desc())
+            if assessment_id is None:
+                query = query.where(Claim.id.not_in(select(ClaimArchive.claim_id)))
+            claims = session.scalars(query).all()
             assessments = {row.claim_id: row for row in session.scalars(select(Assessment))}
             decisions = {row.assessment_id: row for row in session.scalars(select(DecisionRecord))}
             decisions.update({row.assessment_id: row for row in session.scalars(select(FraudRoutingCorrection))})
@@ -104,8 +112,9 @@ def create_app(data_dir=None, auto_seed=False):
         from backend.model_settings import settings
         enabled, model = settings()
         return {"status": "ok", "environment": "synthetic", "rules": "provisional",
-                "mode": "claude-intake-first-v3", "execution_mode": "anthropic-tools" if enabled else "deterministic-tools", "model": model if enabled else None,
-                "policy_generator": "vehicle-use-locality-v1"}
+                "storage": "supabase" if store.database_url else "sqlite",
+                "mode": "claude-intake-first-v3", "selected_pdf_workflow": selected_pdf_workflow(),
+                "execution_mode": "anthropic-tools" if enabled else "deterministic-tools", "model": model if enabled else None}
 
     @app.get("/api/overview")
     def overview():
@@ -144,87 +153,97 @@ def create_app(data_dir=None, auto_seed=False):
             calls = session.scalars(select(ToolCall).where(ToolCall.assessment_id == assessment_id).order_by(ToolCall.id)).all()
             history = next((call.response["records"] for call in reversed(calls)
                             if call.tool in {"retrieve_comparable_claims", "search_history"} and "records" in call.response), [])
+            selected_policy = assessment.context.get("selected_policy")
             context = {**assessment.context, "findings": {
-                stage: display_finding(finding, claim.payload)
+                stage: display_finding(finding, claim.payload, selected_policy)
                 for stage, finding in assessment.context.get("findings", {}).items()}}
+            triage = ({**decision.payload, "justification": staff_justification(decision.payload, assessment.context, claim.payload)}
+                      if decision and summary["route"] else None)
             return {**summary, "submission": claim.payload, "context": context, "version": assessment.version,
                     "trace_id": trace_id_for(assessment_id),
                     "synthetic_evidence": {"historical_costs": history} if claim.batch_id != "manual" else None,
                     "error": assessment.error or (failure_reason(assessment.context) if summary["status"] == "failed" else None),
-                    "decision": decision.payload if decision and summary["route"] else None,
+                    "decision": triage,
                     "investigation_tasks": completed_model_assignments(session, assessment, runs),
                     "tool_calls": [{"id": c.id, "stage": c.stage, "tool": c.tool, "request": c.request, "response": c.response} for c in calls],
-                    "runs": [{"id": r.id, "stage": r.stage, "finding": display_finding(r.finding, claim.payload), "instruction": r.instruction,
+                    "runs": [{"id": r.id, "stage": r.stage, "finding": display_finding(r.finding, claim.payload, selected_policy), "instruction": r.instruction,
                               "input_version": r.input_version, "duration_ms": r.duration_ms} for r in runs]}
 
-    @app.get("/api/generator/people-policies")
-    def people_policies():
-        return {"records": list_people_policies(store)}
-
-    @app.post("/api/generator/people-policies", status_code=201)
-    def create_people_policies(request: GenerateRequest):
-        try:
-            with policy_generation_lock:
-                result = generate_people_policies(store, request.count)
-        except GenerationError as error:
-            raise HTTPException(503, str(error)) from error
-        app.state.worker.wake.set()
-        return result
-
-    @app.get("/api/generator/claim-policies")
-    def available_claim_policies():
-        return {"records": claim_policies(store)}
-
     @app.post("/api/generator/preview")
-    def preview(request: ClaimPreviewRequest):
+    def preview(request: ClaimPreviewRequest, http_request: Request):
         batch_id = str(uuid.uuid4())
-        with generation_lock:
-            recent_discards = list(discarded_incidents)
         try:
-            batch = preview_batch(store, request.count, batch_id, request.policy_id, discarded_previews=recent_discards)
-        except PolicySelectionError as error:
+            plans = plan_scheduled_claims(store, request.count)
+        except ValueError as error:
             raise HTTPException(409, str(error)) from error
+        with generation_lock:
+            recent_discards = list(discarded_fixtures)
+        try:
+            batch = preview_scheduled_batch(plans, batch_id, discarded_previews=recent_discards,
+                                            actor_id=http_request.state.actor.id)
         except GenerationError as error:
             raise HTTPException(503, str(error)) from error
-        with generation_lock:
-            pending_previews[batch_id] = batch
-        fixtures = [{"claim": item["claim"], "person": item["person"], "scenario": item["scenario"],
-                     "conditions": item["conditions"], "scenario_type": item["scenario_key"], "plan": item["plan"]}
+        with store.session.begin() as session:
+            session.add(SyntheticClaimPreview(batch_id=batch_id, payload=batch))
+        fixtures = [{key: item[key] for key in ("claim", "scenario", "scenario_type")}
                     for item in batch["fixtures"]]
         return {"batch_id": batch_id, "count": len(fixtures), "fixtures": fixtures}
 
-    @app.post("/api/generator/preview/{batch_id}/commit", status_code=202)
+    @app.post("/api/generator/preview/{batch_id}/commit", status_code=201)
     def commit_preview(batch_id: str):
         with generation_lock:
-            spec = pending_previews.get(batch_id)
-            if spec is None:
-                raise HTTPException(404, "Preview not found or already added")
-            count = len(spec["fixtures"])
-            with store.session() as session:
-                pending = session.scalar(select(func.count()).select_from(Assessment).where(Assessment.status.in_(["queued", "processing"])))
-            if pending + count > 160:
-                raise HTTPException(409, "The local worker already has 160 pending claims; wait for processing to finish.")
-            try:
-                result = commit_batch(store, labels_path, batch_id, spec)
-            except PolicySelectionError as error:
-                raise HTTPException(409, str(error)) from error
-            del pending_previews[batch_id]
-        app.state.worker.wake.set()
+            result = commit_pending_preview(store, labels_path, batch_id)
+        if result is None:
+            raise HTTPException(404, "This preview is unavailable. Discard it and generate a new preview.")
         return result
+
+    @app.get("/api/generator/batches/{batch_id}/dataset.{format}")
+    def export_dataset(batch_id: str, format: Literal["json", "csv", "zip"]):
+        records = dataset_records(store, labels_path, batch_id)
+        if not records:
+            raise HTTPException(404, "No unstructured records found for this batch")
+        headers = {"Content-Disposition": f'attachment; filename="synthetic_auto_claims.{format}"'}
+        if format == "zip":
+            archive = dataset_zip(store, records)
+            if archive is None:
+                raise HTTPException(404, "No linked policy schedules and attachments found for this batch")
+            return Response(archive, media_type="application/zip", headers=headers)
+        if format == "csv":
+            return Response(dataset_csv(records), media_type="text/csv", headers=headers)
+        return JSONResponse(records, headers=headers)
 
     @app.delete("/api/generator/preview/{batch_id}", status_code=204)
     def discard_preview(batch_id: str):
         with generation_lock:
-            batch = pending_previews.pop(batch_id, None)
-            if batch:
-                discarded_incidents.extend((batch["policy_id"], {"incident": item["plan"]["incident"], "loss_type": item["plan"]["loss_type"]})
-                                           for item in batch["fixtures"])
+            with store.session.begin() as session:
+                begin_write(session)
+                pending = session.get(SyntheticClaimPreview, batch_id)
+                if pending is None:
+                    return
+                session.delete(pending)
+            discarded_fixtures.extend(item["claim"]["narrative"] for item in pending.payload["fixtures"])
+
+    @app.post("/api/claims/{assessment_id}/process", status_code=202)
+    def process(assessment_id: str, request: Request):
+        try:
+            status = queue_with_matching_schedule(store, assessment_id, request.state.actor.id)
+        except KeyError as error:
+            raise HTTPException(404, "Assessment not found") from error
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+        if status == "queued":
+            app.state.worker.wake.set()
+        return {"id": assessment_id, "status": status}
 
     @app.post("/api/generator/batches/{batch_id}/start", status_code=202)
     def start_batch(batch_id: str):
+        if batch_id == "manual":
+            raise HTTPException(409, "New investigations for legacy manual claims are closed.")
         with generation_lock:
             with store.session.begin() as session:
-                assessments = session.scalars(select(Assessment).join(Claim).where(Claim.batch_id == batch_id)).all()
+                assessments = session.scalars(select(Assessment).join(Claim).where(
+                    Claim.batch_id == batch_id, Claim.id.not_in(select(ClaimArchive.claim_id))
+                )).all()
                 if not assessments:
                     raise HTTPException(404, "Batch not found")
                 if any(row.status != "awaiting_review" for row in assessments):
@@ -238,7 +257,7 @@ def create_app(data_dir=None, auto_seed=False):
     @app.post("/api/claims/{assessment_id}/retry", status_code=202)
     def retry(assessment_id: str):
         with store.session.begin() as session:
-            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            begin_write(session)
             assessment = session.get(Assessment, assessment_id)
             if assessment is None:
                 raise HTTPException(404, "Assessment not found")
@@ -255,11 +274,13 @@ def create_app(data_dir=None, auto_seed=False):
         if not reviewer:
             raise HTTPException(422, "Reviewer name is required")
         with store.session.begin() as session:
-            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            begin_write(session)
             task = session.get(HumanTask, task_id)
             if task is None:
                 raise HTTPException(404, "Task not found")
             assessment = session.get(Assessment, task.assessment_id)
+            if session.get(ClaimArchive, assessment.claim_id):
+                raise HTTPException(409, "This claim is archived")
             if session.get(InvestigationRevision, assessment.id) or can_reprocess(assessment, adjudicated=session.get(Adjudication, assessment.id) is not None):
                 raise HTTPException(409, "Use the latest completed investigation before acknowledging a routing task.")
             if task.status != "pending":
@@ -272,6 +293,14 @@ def create_app(data_dir=None, auto_seed=False):
     @app.get("/api/evaluation")
     def evaluation(batch_id: str | None = None):
         return evaluate(store, labels_path, batch_id)
+
+    @app.get("/api/claims/{assessment_id}/specialist-inputs")
+    def investigation_inputs(assessment_id: str):
+        with store.session() as session:
+            if session.get(Assessment, assessment_id) is None:
+                raise HTTPException(404, "Claim not found")
+            stages = specialist_inputs(session, assessment_id)
+        return JSONResponse({"stages": stages}, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/claims/{assessment_id}/audit")
     def audit(assessment_id: str):

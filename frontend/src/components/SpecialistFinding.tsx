@@ -4,6 +4,7 @@ import type { Finding } from "../types";
 type Amount = string | number | null;
 type FactRow = [label: string, value: string | number | null | undefined];
 type CoverageOutcome = "covered" | "not_covered" | "undetermined";
+type CoverageState = "confirmed" | "partially_confirmed" | "unconfirmed";
 type CoverageItem = { item: string; outcome: CoverageOutcome; reason: string; policy_term?: string; passage_refs?: string[]; document_refs?: string[] };
 type WordingRetrieval = { title?: string; version?: string; passages?: { source: string; page: number; text: string }[] };
 type PolicyConflict = {
@@ -26,6 +27,9 @@ type FindingDetails = {
   error_message?: string;
   coverage_status?: string;
   coverage_reason?: string;
+  coverage_unconfirmed_reason?: string;
+  coverage_outcome?: { state: CoverageState; reason: string };
+  coverage_historical_context?: { reason: string; claim_references: string[] };
   coverage_items?: CoverageItem[];
   submitted_documents?: Record<string, string>;
   document_inconsistencies?: { reason: string; document_refs: string[] }[];
@@ -48,6 +52,12 @@ const statusLabels: Record<string, string> = {
   fraud: "Indicator raised",
   information: "Needs information",
   review: "Review required",
+};
+
+const coverageLabels: Record<CoverageState, string> = {
+  confirmed: "Confirmed",
+  partially_confirmed: "Partially confirmed",
+  unconfirmed: "Unconfirmed",
 };
 
 const resultLabel = (value?: string) => {
@@ -148,7 +158,7 @@ function FraudSeverityGroups({ concerns }: { concerns: NonNullable<FindingDetail
 
 function undeterminedReason(details: FindingDetails) {
   if (details.error_type && ["ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout", "TimeoutException"].includes(details.error_type)) {
-    return "The Coverage model timed out. Reprocess the claim to complete the assessment.";
+    return "The Coverage check timed out before returning a result.";
   }
   if (details.error_type === "ModelOutputTruncated") return "The Coverage response reached its length limit before a decision was returned.";
   if (details.error_message === "Incomplete model response") return "Coverage started but the model did not return a complete decision.";
@@ -229,24 +239,36 @@ export default function SpecialistFinding({ finding }: { finding: Finding }) {
   const leads = details.fraud_investigation?.leads ?? [];
   const fraudConcerns = details.fraud_concerns ?? [];
   const omissions = details.policy_omissions ?? [];
-  const coverageIssue = finding.agent === "coverage" && !omissions.length && !details.coverage_items?.some(item => item.policy_term) &&
-    (details.error_type || details.coverage_status === "UNRESOLVED" || details.coverage_status === "NEEDS_INFORMATION");
+  const coverageIssue = details.error_type || details.coverage_status === "UNRESOLVED" || details.coverage_status === "NEEDS_INFORMATION";
+  const coverageReason = finding.agent === "coverage"
+    ? details.coverage_outcome?.reason ?? details.coverage_unconfirmed_reason ?? (coverageIssue ? details.coverage_reason ?? undeterminedReason(details) : null)
+    : null;
+  const coverageLabel = finding.agent === "coverage" && details.coverage_outcome ? coverageLabels[details.coverage_outcome.state] : null;
   const reasons = [...new Set([
     ...(details.review_reasons ?? []),
     ...(details.duplicate_matches?.length ? ["An earlier claim matches the vehicle and incident. Check whether this is a duplicate."] : []),
     ...(details.error_type && finding.agent !== "coverage" ? ["The specialist could not complete its investigation. Reprocess the claim to continue."] : []),
-    ...(coverageIssue ? [details.coverage_reason ?? undeterminedReason(details)] : []),
-  ].map(readableText))];
+  ].map(readableText))].filter(reason => !coverageReason || reason !== readableText(coverageReason));
   return (
     <article className="finding specialist-finding">
       <header className="finding-heading">
         <h3>{stageNames[finding.agent] ?? resultLabel(finding.agent)}</h3>
-        <span className={`finding-status ${finding.status}`}>{details.error_type ? "Processing interrupted" : (statusLabels[finding.status] ?? resultLabel(finding.status))}</span>
+        <span className={`finding-status ${coverageLabel ? details.coverage_outcome?.state === "confirmed" ? "pass" : "review" : finding.status}`}>
+          {coverageLabel ?? (details.error_type ? "Processing interrupted" : statusLabels[finding.status] ?? resultLabel(finding.status))}
+        </span>
       </header>
       {finding.agent === "intake" && <IntakeFacts details={details} />}
       {finding.agent === "intake" && <IntakeReadiness details={details} />}
       {finding.agent === "coverage" && (
         <>
+          {coverageReason && <section className="finding-section">
+            <h4>Coverage rationale</h4>
+            <p>{readableText(coverageReason)}</p>
+          </section>}
+          {details.coverage_historical_context && <section className="finding-section">
+            <h4>How earlier decisions informed coverage</h4>
+            <p>{readableText(details.coverage_historical_context.reason)}</p>
+          </section>}
           {details.analysis?.classified_loss && <FactSection title="Loss classification" rows={[["Assessed loss type", lossTypeLabel(details.analysis.classified_loss)]]} />}
           <CoverageResults details={details} />
         </>

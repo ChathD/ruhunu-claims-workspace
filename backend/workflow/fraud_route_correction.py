@@ -4,6 +4,7 @@ import uuid
 from sqlalchemy import select
 
 from backend.agents.fraud_specialist import high_severity_concerns
+from backend.storage.postgres import begin_write
 from backend.storage.sqlite_store import Adjudication, AgentRun, Assessment, Claim, DecisionRecord, FraudRoutingCorrection, HumanTask, digest
 from backend.claim_schemas import Route
 from backend.workflow.routing_rules import select_route
@@ -11,7 +12,7 @@ from backend.workflow.routing_rules import select_route
 
 def escalate_published_high_severity(store, assessment_id):
     with store.session.begin() as session:
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        begin_write(session)
         existing = session.get(FraudRoutingCorrection, assessment_id)
         if existing:
             return existing.payload

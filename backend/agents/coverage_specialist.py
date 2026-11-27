@@ -6,9 +6,11 @@ from decimal import Decimal
 from backend.agents.intake_specialist import cost_breakdown, cost_evidence, missing_cost_fields
 from backend.claim_schemas import Finding, REQUIRED_POLICY_FIELDS
 from backend.evidence.required_claim_evidence import (
-    additional_charge_receipts, additional_charge_totals,
+    additional_charge_receipts, additional_charge_totals, cost_line_total,
     policy_lists_loss, required_claimant_gaps, required_gap,
 )
+from backend.evidence.synthetic_claim_text import TEXT_REF_PREFIX, available_text_refs, document_text_refs
+from backend.evidence.vehicle_market_value import assess_repair_market_cap, repair_market_cap_applies
 
 
 POLICY_SILENCE = re.compile(
@@ -17,6 +19,7 @@ POLICY_SILENCE = re.compile(
     r"(?:addresses|specifies|requires|mandates|found))\b"
     r"|\b(?:not (?:specified|addressed|stated)|absent) in (?:the )?(?:policy|wording|schedule)\b"
 )
+CHASSIS_IDENTIFIER = re.compile(r"\b(?:chassis[ _]+(?:number|no|identifier)|vehicle identification number|vin)\b", re.I)
 
 
 def describes_policy_silence(term):
@@ -38,10 +41,6 @@ def separate_policy_omissions(items, omissions):
                 and any("police report" in existing for existing in existing_topics)):
             gaps.append({"item": label, "impact": item["reason"]})
     return remaining, gaps
-
-
-def normalize_chassis(value):
-    return "".join(value.split()).replace("-", "").upper()
 
 
 def document_vehicle_matches(document, policy):
@@ -80,6 +79,18 @@ def investigate(tools):
     context = tools["read_context"].invoke({})
     claim = tools["read_submission"].invoke({})
     retrieved = tools["retrieve_policy"].invoke({})
+    if selected := retrieved.get("selected_policy"):
+        intake = context["findings"].get("intake", {}).get("details", {})
+        details = {"coverage_status": "PENDING_ANALYSIS", "missing": [], "selected_policy": selected,
+                   "coverage_scope": "selected policy wording", "document_text_refs": document_text_refs(claim),
+                   "deferred_cost_gaps": intake.get("deferred_cost_gaps", [])}
+        evidence = ["tool:retrieve_policy"]
+        if (not claim.get("motor_benefit") and (lookup := tools.get("retrieve_vehicle_market_value"))
+                and repair_market_cap_applies(claim, context.get("policy_schedule"))):
+            details["settlement_market_cap"] = market_cap = assess_repair_market_cap(claim, lookup.invoke({}))
+            evidence.append(market_cap["evidence_ref"])
+        return Finding(agent="coverage", status="pass", summary="Prepared the claim for review against the selected policy PDF.",
+                       evidence=evidence, details=details)
     policy = retrieved["policy"]
     if policy is None:
         return Finding(agent="coverage", status="review", summary="Authoritative policy record is unavailable; internal review required.",
@@ -112,10 +123,16 @@ def investigate(tools):
         for gap in missing_cost_fields(claim):
             if gap not in missing:
                 missing.append(gap)
+    sources = document_text_refs(claim)
+    evidence = ["submission:/loss_date", "tool:retrieve_policy", *dict.fromkeys(sources.values())]
+    if (fnol := TEXT_REF_PREFIX + "fnol_transcript") in available_text_refs(claim):
+        evidence.append(fnol)
+    details = {"coverage_status": "PENDING_ANALYSIS", "policy": policy, "missing": missing}
+    if sources:
+        details["document_text_refs"] = sources
     return Finding(agent="coverage", status="information" if missing else "pass",
                    summary="Checked required policy fields and the effective period. The loss date is within the policy period.",
-                   evidence=["submission:/loss_date", "tool:retrieve_policy"],
-                   details={"coverage_status": "PENDING_ANALYSIS", "policy": policy, "missing": missing})
+                   evidence=evidence, details=details)
 
 
 def apply_approval_controls(finding, claim, retrieved, conclusion):
@@ -145,37 +162,17 @@ def apply_approval_controls(finding, claim, retrieved, conclusion):
                 "policy_term": terms, "reason": reason}]
         finding.summary += f" Coverage is not supported for the declared {claim['loss_type']} incident."
         return
-    insured = policy.get("vehicle") or {}
-    reported = claim.get("vehicle") or {}
-    insured_chassis = normalize_chassis(insured.get("chassis_number") or "")
-    reported_chassis = normalize_chassis(reported.get("chassis_number") or "")
-    mismatches = []
-    if claim.get("registration") != policy["registration"]:
-        mismatches.append("registration")
-    if insured_chassis and reported_chassis and insured_chassis != reported_chassis:
-        mismatches.append("chassis number")
-    for field in ("make", "model", "year"):
-        if insured.get(field) and reported.get(field) and str(insured[field]).casefold() != str(reported[field]).casefold():
-            mismatches.append(field)
-    if mismatches:
+    registration = claim.get("registration")
+    if registration != policy["registration"]:
+        reason = (f"The claim reports registration {registration}, but the policy identifies {policy['registration']}."
+                  if registration else "The claim does not give a vehicle registration to match to the insured vehicle.")
         finding.status = "review"
-        finding.details.update(coverage_status="UNRESOLVED", vehicle_mismatches=mismatches,
-                               coverage_reason=f"The reported vehicle differs from the insured vehicle in {', '.join(mismatches)}.")
+        finding.details.update(coverage_status="UNRESOLVED", vehicle_mismatches=["registration"], coverage_reason=reason)
         finding.details["coverage_items"] = [{"item": "Insured vehicle identity", "outcome": "undetermined",
             "policy_term": f"The policy identifies the insured vehicle as {policy['registration']}.",
-            "reason": finding.details["coverage_reason"]}]
-        finding.summary += f" The claim vehicle differs from the saved policy in {', '.join(mismatches)}."
+            "reason": reason}]
+        finding.summary += f" {reason}"
         return
-    if insured_chassis and not reported_chassis:
-        finding.status = "information"
-        finding.details["coverage_status"] = "NEEDS_INFORMATION"
-        finding.details["coverage_reason"] = "The reported vehicle's chassis number is needed to confirm that it matches the insured vehicle."
-        finding.details["missing"].append(required_gap("vehicle.chassis_number", "Claim form", "Vehicle details",
-            "The chassis number is needed to confirm the reported vehicle matches the insured vehicle."))
-        finding.summary += " The chassis number is needed to confirm the insured vehicle."
-        return
-    if insured_chassis:
-        finding.summary += " The claim registration and chassis number match the insured vehicle."
     if conclusion != "COVERED":
         finding.status = "review"
         finding.details["coverage_status"] = "UNRESOLVED"
@@ -210,16 +207,12 @@ def apply_approval_controls(finding, claim, retrieved, conclusion):
              "policy_term": "Theft cover is limited to the vehicle valuation.",
              "reason": "This theft policy covers the vehicle valuation only."},
         ]
-    for document in documents:
-        document_chassis = normalize_chassis(document.get("chassis_number") or "")
-        if document.get("type") != "repair_estimate" and insured_chassis and document_chassis and document_chassis != insured_chassis:
-            reasons.append(f"Document {document['id']} lists a chassis number that differs from the insured vehicle.")
     if not missing:
         if documents and document_total + additional_total != gross:
             reasons.append(f"Cost documents (LKR {document_total:.2f}) and additional costs (LKR {additional_total:.2f}) "
                            f"do not reconcile to the LKR {gross:.2f} claimed.")
         for document in documents:
-            if sum((Decimal(x["amount"]) for x in document["line_items"]), Decimal(0)) != Decimal(document["total"]):
+            if cost_line_total(document["line_items"]) != Decimal(document["total"]):
                 reasons.append(f"Document {document['id']} does not reconcile to its line items.")
             if not document_vehicle_matches(document, policy) or document["date"] < claim["loss_date"]:
                 reasons.append(f"Document {document['id']} has inconsistent vehicle or incident-date evidence.")

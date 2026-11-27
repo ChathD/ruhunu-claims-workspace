@@ -33,7 +33,8 @@ def export_audit(store, assessment_id):
                                 .order_by(TraceSpan.started_at, TraceSpan.id)).all()
         events = session.scalars(select(WorkflowEvent).where(WorkflowEvent.assessment_id == assessment_id)
                                  .order_by(WorkflowEvent.id)).all()
-        wording_id = assessment.context.get("synthetic_wording_document_id") or assessment.context.get("wording_document_id")
+        wording_id = (assessment.context.get("selected_policy", {}).get("id") or assessment.context.get("synthetic_wording_document_id")
+                      or assessment.context.get("wording_document_id"))
         wording = session.get(PolicyDocument, wording_id) if wording_id else None
         corpus = [session.get(PolicyDocument, identifier) for identifier in assessment.context.get("policy_corpus_ids", [])]
         extraction = [session.get(AttachmentExtraction, file.id) for file in attachments]
@@ -68,7 +69,7 @@ def export_audit(store, assessment_id):
                    "human_actions": [{"reviewer": a.reviewer, "action": a.action, "created_at": a.created_at} for a in actions]}
         if correction:
             event = session.scalar(select(WorkflowEvent).where(WorkflowEvent.assessment_id == assessment_id,
-                WorkflowEvent.kind == "fraud_routing_corrected"))
+                WorkflowEvent.kind.in_(("fraud_routing_corrected", "evidence_routing_corrected"))))
             package["original_decision"] = {"payload": decision.payload, "hash": decision.payload_hash}
             package["decision"], package["decision_hash"] = correction.payload, correction.payload_hash
             package["routing_correction"] = {"created_at": correction.created_at,

@@ -9,14 +9,19 @@ import httpx
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
 
+from backend.agents.claude_investigation import IncompleteModelResponse, ModelOutputTruncated, StructuredResultRejected
 from backend.agents.fraud_specialist import high_severity_concerns
+from backend.assurance.investigation_display import coverage_outcome
+from backend.anthropic_errors import AnthropicRequestError
 from backend.assurance.investigation_tracing import observe_node, trace_span
 from backend.storage.sqlite_store import AgentRun, Assessment, Claim, ToolCall, WorkflowEvent
 from backend.claim_schemas import Finding
 from backend.workflow import specialist_readiness as readiness
 from backend.workflow.investigation_execution import execute_specialist, assess_readiness, recommend_route
-from backend.evidence.approved_claim_history import NO_HISTORY
+from backend.evidence.claim_history import NO_HISTORY
 from backend.workflow.investigation_retry import failure_reason
+from backend.workflow.investigation_plan import plan_round
+from backend.workflow.evidence_verification import verify_round
 
 logger = logging.getLogger(__name__)
 
@@ -36,14 +41,18 @@ class IntakeFirstState(TypedDict):
 
 
 class IntakeFirstWorkflow:
-    def __init__(self, owner):
+    def __init__(self, owner, *, verify_evidence=False):
         self.owner, self.store = owner, owner.store
+        self.verify_evidence = verify_evidence
         graph = StateGraph(IntakeFirstState)
         graph.add_node("mandatory_intake", self.intake)
         graph.add_node("supervisor", self.supervise)
         for role in readiness.ROLES:
             graph.add_node(role, self.specialist(role))
-            graph.add_edge(role, "collect")
+            graph.add_edge(role, "verify" if verify_evidence else "collect")
+        if verify_evidence:
+            graph.add_node("verify", self.verify)
+            graph.add_edge("verify", "collect")
         graph.add_node("collect", self.collect)
         graph.add_node("judge", self.judge)
         graph.add_node("publish", self.publish)
@@ -94,15 +103,16 @@ class IntakeFirstWorkflow:
             with self.store.session() as session:
                 claim_row = session.get(Claim, session.get(Assessment, identifier).claim_id)
                 claim = claim_row.payload
-                coverage = context["findings"].get("coverage", {}).get("details", {})
-                if (coverage.get("coverage_status") == "COVERED" and "historical_available" not in context
-                        and not readiness.completed(context, "historical")):
+                if "historical_available" not in context and not readiness.completed(context, "historical"):
                     with trace_span("history.eligibility", kind="retriever", metadata={"round": round_number}) as span:
                         context["historical_available"] = bool(self.store.history.records(session, claim_row))
                         span.summary = {"available": context["historical_available"]}
                     if not context["historical_available"]:
                         context.setdefault("skipped", {})["historical"] = NO_HISTORY
-            if raw is None:
+            if raw is None and self.verify_evidence:
+                raw, typed_plan = plan_round(self.store, identifier, context, claim, round_number)
+                context.setdefault("plans_v4", {})[str(round_number)] = typed_plan
+            elif raw is None:
                 raw = assess_readiness(self.store, identifier, context, claim, round_number)
             plan = readiness.validate_selection(raw, context, claim)
             history[str(round_number)] = plan
@@ -113,7 +123,16 @@ class IntakeFirstWorkflow:
             if plan["specialists"]["coverage"]["state"] == "BLOCKED_INPUT" and readiness.coverage_blockers(context):
                 context["skipped"]["coverage"] = "Intake found gaps that prevent Coverage from starting."
         except Exception as error:
-            context["investigation_error"] = f"Readiness validation failed: {type(error).__name__}"
+            if isinstance(error, StructuredResultRejected):
+                raw, error = error.result, error.cause
+            if isinstance(error, ModelOutputTruncated):
+                context["investigation_error"] = "Readiness validation exceeded the response limit after retrying."
+            elif isinstance(error, IncompleteModelResponse):
+                context["investigation_error"] = "Readiness validation did not receive a complete model result after retrying."
+            elif isinstance(error, AnthropicRequestError):
+                context["investigation_error"] = f"Readiness could not complete. {error}"
+            else:
+                context["investigation_error"] = f"Readiness validation failed: {type(error).__name__}"
             history[str(round_number)] = {"rejected_selection": raw, "error": str(error)}
             if isinstance(error, readiness.UnsupportedClaimantGaps):
                 history[str(round_number)]["unsupported_claimant_gaps"] = error.gaps
@@ -134,10 +153,6 @@ class IntakeFirstWorkflow:
             return "judge"
         coverage = findings.get("coverage", {}).get("details", {}).get("coverage_status")
         if coverage in {"INACTIVE", "NOT_COVERED", "UNRESOLVED"}:
-            with self.store.session.begin() as session:
-                row = session.get(Assessment, state["assessment_id"])
-                row.context = {**row.context, "skipped": {**row.context.get("skipped", {}), "historical": f"Coverage gate: {coverage}"}}
-                self.store.add_event(session, row.id, "specialist_skipped", {"stage": "historical", "reason": coverage})
             return "judge"
         if any(f["details"].get("fraud_indicators") or f["details"].get("error_type") for f in findings.values()):
             return "judge"
@@ -150,11 +165,30 @@ class IntakeFirstWorkflow:
             return "judge"
         return "supervisor"
 
-    @observe_node("judge", kind="agent")
+    @observe_node("route_recommendation", kind="agent")
     def judge(self, state):
         if failure_reason(self.owner.state(state["assessment_id"]).context):
             return {"phase": "interrupted"}
+        if self.verify_evidence:
+            return {"phase": "judging"}
         return {**self._judge(state), "phase": "judging"}
+
+    @observe_node("evidence.verify", kind="guardrail")
+    def verify(self, state):
+        identifier, round_number = state["assessment_id"], state["round"]
+        context = self.owner.state(identifier).context
+        if round_number in context.get("collected_rounds", []):
+            return {}
+        if saved := context.get("verified_candidates", {}).get(str(round_number)):
+            return {"results": saved}
+        results, report = verify_round(self.store, identifier, round_number, state["tasks"], state["results"])
+        with self.store.session.begin() as session:
+            row = session.get(Assessment, identifier)
+            row.context = {**row.context,
+                           "verified_candidates": {str(round_number): results},
+                           "verification_rounds": {**row.context.get("verification_rounds", {}), str(round_number): report}}
+            self.store.add_event(session, identifier, "evidence_verified", {"round": round_number, **report})
+        return {"results": results}
 
     def publish(self, state):
         with trace_span("publication", kind="guardrail", metadata={"round": state["round"]}) as span:
@@ -171,7 +205,8 @@ class IntakeFirstWorkflow:
         with self.store.session.begin() as session:
             row = session.get(Assessment, assessment_id)
             row.status, row.error = "processing", None
-        config = {"configurable": {"thread_id": "intake-first:" + assessment_id}, "recursion_limit": 40}
+        prefix = "selected-pdf-v4:" if self.verify_evidence else "intake-first:"
+        config = {"configurable": {"thread_id": prefix + assessment_id}, "recursion_limit": 40}
         saved = self.graph.get_state(config)
         initial = None if saved.next else {"assessment_id": assessment_id, "phase": "intake", "round": 0,
                                            "tasks": {}, "snapshot": {}, "results": {}, "readiness": {}}
@@ -221,12 +256,17 @@ class IntakeFirstWorkflow:
             if round_number in context.get("collected_rounds", []):
                 return {"snapshot": context}
             before = copy.deepcopy(context)
+            if self.verify_evidence:
+                before.pop("verified_candidates", None)
+                context.pop("verified_candidates", None)
             version = row.version + 1
             for role in state["tasks"]:
                 stage = f"r{round_number}:{role}"
                 result = state["results"][stage]
                 finding = copy.deepcopy(result["finding"])
                 key = finding["agent"]
+                if key == "coverage":
+                    finding["details"]["coverage_outcome"] = coverage_outcome(finding["details"], context.get("selected_policy"))
                 prior = context["findings"].get(key)
                 if prior:
                     prior_details = prior["details"]
@@ -254,10 +294,13 @@ class IntakeFirstWorkflow:
         context = copy.deepcopy(self.owner.state(state["assessment_id"]).context)
         if "recommendation" not in context:
             try:
-                context["recommendation"] = recommend_route(self.store, state["assessment_id"], context)
+                recommendation = recommend_route(self.store, state["assessment_id"], context)
+                context["adjuster_summary"] = recommendation.pop("adjuster_summary", [])
+                context["recommendation"] = recommendation
             except Exception as error:
                 logger.exception("Judge failed for assessment %s", state["assessment_id"])
-                context.setdefault("investigation_error", type(error).__name__)
+                reason = f"Decision synthesis could not complete. {error}" if isinstance(error, AnthropicRequestError) else type(error).__name__
+                context.setdefault("investigation_error", reason)
                 context["judge_error"] = {"error_type": type(error).__name__, "error_message": str(error)[:500]}
             with self.store.session.begin() as session:
                 row = session.get(Assessment, state["assessment_id"])

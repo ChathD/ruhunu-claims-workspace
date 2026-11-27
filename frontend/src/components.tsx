@@ -4,7 +4,7 @@ import {
   ChevronRight,
   Search,
 } from "lucide-react";
-import type { Claim, Route } from "./types";
+import type { Claim, Route, VehicleDetails } from "./types";
 import { routeLabels } from "./types";
 
 export const money = (amount: string | number | null | undefined) =>
@@ -18,9 +18,14 @@ export const time = (value: string) =>
     hour: "2-digit",
     minute: "2-digit",
   });
+export const dayMonthYear = (value: string) => value.replace(/^(\d{4})-(\d{2})-(\d{2})$/, "$3/$2/$1");
 const lossTypeLabels: Record<string, string> = { glass: "Glass damage", repair: "Vehicle repair", theft: "Vehicle theft", injury: "Injury", other: "Other",
   third_party_property_damage: "Third-party property damage", third_party_injury: "Third-party injury" };
 export const lossTypeLabel = (type: string) => lossTypeLabels[type] ?? type;
+export const vehicleMakeAndModel = (vehicle?: VehicleDetails | null) =>
+  [vehicle?.make, vehicle?.model].filter(Boolean).join(" ");
+export const claimHeading = (scenario: string, insuredName?: string | null, vehicleName?: string) =>
+  [scenario, insuredName, vehicleName].filter(Boolean).join(" · ");
 export const insuranceTypeLabel = (type: "comprehensive" | "third_party") => type === "comprehensive" ? "Comprehensive" : "Third-party";
 export const stageNames: Record<string, string> = {
   intake: "Intake & duplicate check",

@@ -6,11 +6,26 @@ from pydantic import BaseModel, ConfigDict, Field
 from backend.agents import claude_investigation as agentic
 from backend.evidence.required_claim_evidence import committed_required_gaps, required_claimant_gaps
 from backend.workflow.specialist_context import generated_policy_context
+from backend.workflow.versions import V3 as WORKFLOW
 
-WORKFLOW = "claude-intake-first-v3"
 ROLES = ("coverage", "fraud", "historical")
 MAX_ROUNDS = 4
 UNSUPPORTED_CLAIMANT_GAPS = "Claimant evidence gap is not supported by an executed finding"
+
+READINESS_PROMPT = """## Task
+Intake has finished. Assess whether Coverage, Fraud and Historical can start. Readiness means enough evidence to investigate.
+
+## Dispatch
+- Coverage requires completed Intake checks for policy lookup, period, vehicle identity, loss and costs. If coverage_blockers is nonempty, mark Coverage BLOCKED_INPUT and copy those blockers into missing_information.
+- When a staff-selected policy PDF is present, direct Coverage to assess the wording or identify the missing contract documents if it is a product summary. Intake records cost gaps separately so Coverage can first examine applicability. For earlier synthetic claims with a saved schedule, direct Coverage to the schedule and its linked wording. The uploaded corpus is for manual claims.
+- A selected PDF gives Intake enough wording to proceed. The submitted number, policy period, vehicle cover and endorsements still require evidence from the individual schedule.
+- Assign Fraud to compare assertions in claim evidence. Missing paperwork and procedural conditions belong to Intake or Coverage. Issuer authentication is outside this workflow.
+- When historical_available is true and Historical is incomplete, dispatch Historical to compare relevant prior decisions. Historical can start as soon as Intake is complete. Use NOT_APPLICABLE with no gaps or task when historical_available is false.
+- If Historical is due, use BLOCKED_DEPENDENCY for Coverage with no task unless Coverage is already blocked by Intake evidence or completed. Coverage uses the committed comparison in the next round.
+- Mark roles in completed_specialists as COMPLETED with no task. Fraud is eligible for another task only when fraud_followup_available is true. Unresolved questions about the same documents do not reopen Fraud.
+
+## Output
+Use assess_readiness. Use one short sentence per reason and task. Give every READY specialist one task and use DISPATCH only when tasks are present. Specialists receive claim facts and policy references separately. For a required gap, name the source, owner and check it blocks. Copy claimant gap names verbatim from allowed_claimant_gap_names. Mention optional evidence only as possible staff follow-up. Cite only the relevant exact IDs from available_evidence_references."""
 
 
 class UnsupportedClaimantGaps(ValueError):
@@ -66,10 +81,15 @@ def completed(context, role):
     return context.get("findings", {}).get(key, {}).get("details", {}).get("checks_executed", False)
 
 
+def historical_due(context):
+    return context.get("historical_available") is True and not completed(context, "historical")
+
+
 def has_new_leads(context):
     findings = context.get("findings", {})
     leads = findings.get("historical", {}).get("details", {}).get("fraud_investigation", {}).get("leads", [])
-    return bool(leads) and not findings.get("fraud_followup", {}).get("details", {}).get("checks_executed")
+    return (bool(leads) and completed(context, "fraud")
+            and not findings.get("fraud_followup", {}).get("details", {}).get("checks_executed"))
 
 
 def claimant_gap_names(context):
@@ -107,7 +127,6 @@ def validate_selection(raw, context, claim):
         raise ValueError("Tasks must match READY specialists exactly")
     if bool(tasks) != (plan.next_action == "DISPATCH"):
         raise ValueError("Next action contradicts task selection")
-    coverage_status = context.get("findings", {}).get("coverage", {}).get("details", {}).get("coverage_status")
     sources = sources_for(context, claim)
     known_gaps = claimant_gap_names(context)
     unsupported_gaps = []
@@ -121,15 +140,16 @@ def validate_selection(raw, context, claim):
             raise ValueError("Unexecuted checks cannot be marked completed")
         if role in tasks and done and not can_follow_up:
             raise ValueError("Completed checks cannot be repeated without new fraud leads")
-        if role == "historical" and role in tasks and coverage_status != "COVERED":
-            raise ValueError("Historical comparison requires confirmed coverage")
+        if role == "historical" and ((role in tasks) != historical_due(context)):
+            raise ValueError("Dispatch Historical when eligible prior claims are available and checks are incomplete")
         if (role == "historical" and context.get("historical_available") is False
                 and (state["state"] != "NOT_APPLICABLE" or state["missing_information"])):
-            raise ValueError("Historical comparison is not applicable without eligible staff-approved claims")
+            raise ValueError("Historical comparison is not applicable without eligible prior claims")
         if role == "coverage" and role in tasks and coverage_blockers(context):
             raise ValueError("Coverage cannot start until Intake confirms enough evidence for all coverage checks")
-        if state["state"] == "NOT_APPLICABLE" and not (role == "historical" and (
-                coverage_status in {"INACTIVE", "NOT_COVERED"} or context.get("historical_available") is False)):
+        if role == "coverage" and role in tasks and historical_due(context):
+            raise ValueError("Coverage requires the committed Historical comparison when prior claims are available")
+        if state["state"] == "NOT_APPLICABLE" and not (role == "historical" and context.get("historical_available") is False):
             raise ValueError("Unsupported not-applicable declaration")
         if state["state"] == "BLOCKED_INPUT" and not state["missing_information"]:
             raise ValueError("Blocked input must identify precise gaps")
@@ -148,25 +168,20 @@ def validate_selection(raw, context, claim):
 def assess(store, assessment_id, context, claim, round_number):
     if claim.get("source") == "Synthetic generator":
         context = generated_policy_context(context)
-    result = agentic.structured_call(store, assessment_id, f"readiness:{round_number}",
-        "Intake has already completed. Assess coverage, fraud and historical readiness separately. "
-        "Select every READY specialist with a concrete task; never select Intake. Enough information means enough to begin investigation, not proven coverage. "
-        "Coverage can start only after the saved Intake checks confirm the submitted policy exists and there is enough evidence "
-        "to assess the policy period, vehicle identity, loss type and claimed costs. When coverage_blockers is nonempty, mark Coverage BLOCKED_INPUT, copy the blockers into its "
-        "missing_information and leave it out of tasks. If Fraud has yet to run, assign it a concrete screening task limited to the available evidence. "
-        "Missing evidence by itself does not constitute a fraud concern. "
-        "Issuer authentication is outside this workflow. Never block a specialist on issuer confirmation. "
-        "For generated claims, assign Coverage to retrieve the saved policy for the submitted policy ID and assess its terms against the claim. "
-        "When synthetic wording is linked, assign Coverage to search that version, cite applicable passages and assess differences with the schedule. "
-        "The uploaded wording corpus is for manual claims only. "
-        "Historical MUST wait for saved COVERED coverage. Completed checks must not repeat, except Fraud once to verify new historical leads. "
-        "Inactive/uncovered coverage or historical_available=false makes Historical NOT_APPLICABLE with no gaps or task. "
-        "Identify exact missing evidence that blocks a required check, its source and claimant/internal owner. For claimant gaps, copy field_or_document "
-        "verbatim from allowed_claimant_gap_names. Describe optional evidence concerns in the explanation as possible follow-up for staff. "
-        "Use supplied exact evidence identifiers. Do not invent document requirements. Use DISPATCH only with tasks; otherwise request evidence, review or finish. "
-        "Auto-approval still requires all mandatory checks and positive supported payable. Keep explanations concise.",
+
+    def validate_result(result):
+        # Dispatch comes first when a specialist is ready. The committed gaps
+        # remain available to the eventual routing decision.
+        if result.tasks:
+            result.next_action = "DISPATCH"
+        validate_selection(result, context, claim)
+
+    result = agentic.structured_call(store, assessment_id, f"readiness:{round_number}", READINESS_PROMPT,
         {"claim": claim, "context": context, "dispatch_round": round_number, "maximum_dispatch_rounds": MAX_ROUNDS,
          "coverage_blockers": coverage_blockers(context),
+         "completed_specialists": [role for role in ROLES if completed(context, role)],
+         "fraud_followup_available": has_new_leads(context),
          "allowed_claimant_gap_names": sorted(claimant_gap_names(context)),
-         "available_evidence_references": sorted(sources_for(context, claim))}, Selection, "assess_readiness")
+         "available_evidence_references": sorted(sources_for(context, claim))}, Selection, "assess_readiness",
+        validate_result=validate_result)
     return result.model_dump()

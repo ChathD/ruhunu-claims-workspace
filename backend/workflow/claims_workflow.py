@@ -11,7 +11,7 @@ from backend.storage.sqlite_store import AgentRun, Assessment, Claim, DecisionRe
 from backend.claim_schemas import AUTHORITY, Route, STAGES
 from backend.workflow.specialist_context import generated_policy_context
 from backend.workflow.routing_rules import select_route
-from backend.workflow.specialist_readiness import WORKFLOW
+from backend.workflow.versions import SUPPORTED, V4
 from backend.workflow.investigation_retry import failure_reason, investigation_age, mark_failed
 
 
@@ -22,8 +22,19 @@ class UnsupportedWorkflowVersion(ValueError):
 class ClaimsWorkflow:
     def __init__(self, store, checkpoint_path: Path):
         self.store = store
-        self.connection = sqlite3.connect(checkpoint_path, check_same_thread=False)
-        self.checkpointer = SqliteSaver(self.connection)
+        if store.database_url:
+            from langgraph.checkpoint.postgres import PostgresSaver
+            from psycopg import connect
+            from psycopg.rows import dict_row
+
+            url = store.engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
+            self.connection = connect(url, autocommit=True, prepare_threshold=0, row_factory=dict_row)
+            self.connection.execute("SET search_path TO ruhunu, extensions")
+            self.checkpointer = PostgresSaver(self.connection)
+            self.checkpointer.setup()
+        else:
+            self.connection = sqlite3.connect(checkpoint_path, check_same_thread=False)
+            self.checkpointer = SqliteSaver(self.connection)
 
     def state(self, assessment_id):
         with self.store.session() as session:
@@ -71,19 +82,26 @@ class ClaimsWorkflow:
 
     def run(self, assessment_id):
         assessment = self.state(assessment_id)
-        if assessment.status in {"complete", "failed"}:
+        if assessment.status not in {"queued", "processing"}:
             return
         with claim_trace(self.store, assessment) as span:
             result = self._run(assessment)
             finished = self.state(assessment_id)
             span.summary = {"status": finished.status, "context_version": finished.version}
+            if finished.status == "complete":
+                with self.store.session() as session:
+                    if decision := session.get(DecisionRecord, assessment_id):
+                        span.output = decision.payload
+                        span.final_investigation_context = finished.context
+                        span.summary.update(route=decision.payload.get("route"), reason_codes=decision.payload.get("reason_codes", []))
             if finished.status == "failed":
                 span.error_type = "InvestigationInterrupted"
             return result
 
     def _run(self, assessment):
         assessment_id = assessment.id
-        if assessment.execution.get("workflow") != WORKFLOW:
+        version = assessment.execution.get("workflow")
+        if version not in SUPPORTED or version == V4 and not assessment.context.get("selected_policy"):
             raise UnsupportedWorkflowVersion("Create a new Intake-first investigation; this stored workflow is no longer executable")
         with self.store.session.begin() as session:
             row = session.get(Assessment, assessment_id)
@@ -112,6 +130,10 @@ class ClaimsWorkflow:
                 mark_failed(self.store, session, current, reason)
                 return
         from backend.workflow.intake_first_graph import IntakeFirstWorkflow
+        if version == V4:
+            if not hasattr(self, "selected_pdf"):
+                self.selected_pdf = IntakeFirstWorkflow(self, verify_evidence=True)
+            return self.selected_pdf.run(assessment_id)
         if not hasattr(self, "intake_first"):
             self.intake_first = IntakeFirstWorkflow(self)
         return self.intake_first.run(assessment_id)

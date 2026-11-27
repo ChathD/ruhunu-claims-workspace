@@ -1,18 +1,23 @@
-"""Compare similar approved claims to assess costs and identify leads for fraud follow-up."""
+"""Compare similar prior claims to assess costs and identify leads for fraud follow-up."""
 from decimal import Decimal
 from statistics import median
 
 from backend.agents.intake_specialist import cost_breakdown, cost_evidence, missing_cost_fields
 from backend.claim_schemas import Finding
-from backend.evidence.approved_claim_history import uses_document_reference
+from backend.evidence.claim_history import uses_document_reference
+from backend.evidence.required_claim_evidence import cost_line_total
+from backend.evidence.synthetic_claim_text import TEXT_REF_PREFIX, available_text_refs
 
 def investigate(tools):
     claim = tools["read_submission"].invoke({})
     records = tools["retrieve_comparable_claims"].invoke({})["records"]
     available = claim.get("gross_amount") not in (None, "") and bool(records)
+    evidence = ["tool:retrieve_comparable_claims", "submission:/gross_amount"]
+    if cost_evidence(claim)[0] and (cost_text := TEXT_REF_PREFIX + "repair_estimate_text") in available_text_refs(claim):
+        evidence.append(cost_text)
     return Finding(agent="historical", status="pass" if available else "review",
                    summary="Comparable records gathered for analysis." if available else "The claimed amount or comparable records are unavailable.",
-                   evidence=["tool:retrieve_comparable_claims", "submission:/gross_amount"], details={})
+                   evidence=evidence, details={})
 
 
 def cost_document_reference(claim, document):
@@ -24,7 +29,7 @@ def cost_document_reference(claim, document):
 
 
 def reference_leads(claim, records):
-    """Exact-match candidates for offline fixture runs and scripted providers."""
+    """Find exact repeats of a current cost document reference across distinct prior incidents."""
     leads = []
     for document in cost_evidence(claim)[0]:
         reference = cost_document_reference(claim, document)
@@ -39,7 +44,7 @@ def cost_document_amount(claim):
     if not documents or any(
         document.get("total") in (None, "") or not document.get("line_items")
         or any(item.get("amount") in (None, "") or not item.get("description") for item in document["line_items"])
-        or sum(Decimal(item["amount"]) for item in document["line_items"]) != Decimal(document["total"])
+        or cost_line_total(document["line_items"]) != Decimal(document["total"])
         for document in documents
     ):
         return None
@@ -57,7 +62,7 @@ def exact_scope_ids(claim, records):
             and scope(row) == current_scope]
 
 
-def apply_comparison(finding, claim, records, conclusion, proposed_leads, comparable_ids=None):
+def apply_comparison(finding, claim, records, conclusion, proposed_leads=None, comparable_ids=None, *, review_assessment=None):
     """Reproduce the benchmark from the cost evidence the specialist selected."""
     records = [row for row in records if Decimal(row["gross_cost"]) > 0]
     by_id = {row["id"]: row for row in records}
@@ -70,12 +75,14 @@ def apply_comparison(finding, claim, records, conclusion, proposed_leads, compar
     middle = median(costs) if costs else None
     current_cost = cost_document_amount(claim)
     _, additional_total = cost_breakdown(claim, [])
-    if len(costs) < 5 or current_cost is None:
+    if not costs or current_cost is None:
         conclusion = "INSUFFICIENT_EVIDENCE"
     elif conclusion is None:
         conclusion = "REQUIRES_REVIEW" if additional_total or current_cost > middle * 2 else "SUPPORTED"
     leads = []
     documents = {document["id"]: document for document in cost_evidence(claim)[0]}
+    if proposed_leads is None:
+        proposed_leads = reference_leads(claim, records)
     for proposed in proposed_leads:
         document = documents.get(proposed["document_id"])
         history_ids = list(dict.fromkeys(proposed["history_ids"]))
@@ -85,7 +92,7 @@ def apply_comparison(finding, claim, records, conclusion, proposed_leads, compar
         matches = {by_id[identifier]["incident_id"] for identifier in history_ids if uses_document_reference(by_id[identifier], reference)}
         if len(matches) < 2 or any(not uses_document_reference(by_id[identifier], reference) for identifier in history_ids):
             raise ValueError("Historical lead does not identify matching estimate references across distinct incidents")
-        leads.append({"pattern": "Current cost document reference occurs in multiple settled incidents",
+        leads.append({"pattern": "Current cost document reference occurs in multiple prior incidents",
                       "document_reference": reference, "document_id": document["id"],
                       "history_ids": history_ids,
                       "alternative": "Reference collision or issuer clerical error. Independently verify before referral."})
@@ -97,14 +104,27 @@ def apply_comparison(finding, claim, records, conclusion, proposed_leads, compar
               "observed_range": [str(costs[0]), str(costs[-1])] if costs else None,
               "normalization": "Comparable damage and work, same loss type and currency. No inflation adjustment.",
               "limitation": "Historic cost document amounts are submitted amounts. Additional costs are assessed separately."}
+    if current_cost is not None and (cost_text := TEXT_REF_PREFIX + "repair_estimate_text") in available_text_refs(claim):
+        amount["current_cost_text_ref"] = cost_text
+    comparable_sources = {identifier: by_id[identifier]["cost_document_text_refs"] for identifier in comparable_amounts
+                          if by_id[identifier].get("cost_document_text_refs")}
+    if comparable_sources:
+        amount["comparable_cost_text_refs"] = comparable_sources
+    review_history = [{"claim_id": row["id"], "claim_reference": row.get("claim_reference", row["id"]),
+                       "loss_date": row.get("loss_date"), "narrative": row.get("narrative"),
+                       "triage_decision": row.get("triage_decision"), "staff_decision": row.get("staff_decision")}
+                      for identifier in selected if (row := by_id[identifier]).get("triage_decision") or row.get("staff_decision")]
     if middle is None:
         finding.summary += " No usable cost documents for a like-for-like comparison."
     else:
-        finding.summary += f" {len(costs)} comparable cost documents with a median total of LKR {middle:.2f}."
-    if 0 < len(costs) < 5:
-        finding.summary += " At least five usable comparables are required to support the benchmark."
+        document_count = "1 comparable cost document" if len(costs) == 1 else f"{len(costs)} comparable cost documents"
+        finding.summary += f" {document_count} with a median total of LKR {middle:,.2f}."
     if leads:
         finding.summary += " The repeated cost document reference needs independent fraud verification."
     if conclusion != "SUPPORTED":
         finding.status = "information" if missing_cost_fields(claim) else "review"
     finding.details.update(amount_justification=amount, fraud_investigation={"leads": leads})
+    if review_history:
+        finding.details["review_history"] = review_history
+        if review_assessment:
+            finding.details["review_assessment"] = review_assessment

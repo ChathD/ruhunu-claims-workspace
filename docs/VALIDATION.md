@@ -4,7 +4,7 @@
 
 Manual submissions now queue investigation instead of publishing immediate review. Tests cover the shared Claude graph, native image-input construction, cached extraction, unreadable documents, immutable original submissions, staff adjudication after triage, internal-evidence privacy, and idempotent legacy investigation revisions.
 
-A live isolated manual PDF submission completed all four specialists, uploaded-document extraction, policy RAG and judge publication with 16 successful model requests and no provider failures. It routed to adjuster review and its audit passed verification. The artifact is `.local/manual-validation/0551b14e-314f-4072-b46c-3186b54cf16c/audit.json`. `scripts/validate-manual.py` reproduces this check with synthetic evidence and incurs API usage. This does not establish independent document or policy authenticity.
+A live isolated manual PDF submission completed all four specialists, uploaded-document extraction, policy RAG and judge publication with 16 successful model requests and no provider failures. It routed to adjuster review and its audit passed verification. The artifact is `.local/manual-validation/0551b14e-314f-4072-b46c-3186b54cf16c/audit.json`. This result predates the removal of manual claim submission. This does not establish independent document or policy authenticity.
 
 ## Claude supervisor and policy RAG update
 
@@ -13,7 +13,7 @@ A live isolated manual PDF submission completed all four specialists, uploaded-d
 - The actual local `all-MiniLM-L6-v2` model indexed demonstration wording and returned 384-dimensional embeddings. A separate check loaded its cached revision without network access.
 - A real Claude Sonnet 4.6 claim investigation selected all four specialists, executed policy search and evidence checks, completed the follow-up supervisor and judge, and published adjuster review with exact source citations. Fifteen model requests completed with no provider failures. This validates integration, not recommendation accuracy or production calibration.
 - Earlier live checks exposed overlong explanations and citation IDs with appended descriptions. Concise prompts and evidence-ID schema enums corrected those issues; invalid responses correctly required human review.
-- The successful isolated smoke-test audit is under `.local/agentic-validation/0eb2cd66-932d-4a4f-8226-b65988ccc03c/audit.json` and passed integrity verification. `scripts/validate-agentic.py` reproduces the check using a fresh isolated database and incurs model usage.
+- The earlier isolated smoke-test audit is under `.local/agentic-validation/0eb2cd66-932d-4a4f-8226-b65988ccc03c/audit.json`. Run `scripts/validate-agentic.py <policy-pdf>` to check the current workflow in a fresh isolated database using Claude.
 - Windows sandbox socket restrictions prevented TestClient from creating its event loop. The full API suite passed outside that sandbox. Manual uploads remain staff-reviewed; scanned policy pages require OCR.
 
 The sections below record the earlier deterministic implementation's validation, not Claude evaluation results.

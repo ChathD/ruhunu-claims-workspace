@@ -1,9 +1,18 @@
-"""Resolve policy-specific document requirements and identify gaps that block assessment."""
+"""Resolve claim evidence requirements and identify gaps that block assessment."""
+import re
 from decimal import Decimal
 
 from backend.claim_schemas import THIRD_PARTY_LOSSES
 
 SUPPORTING_DOCUMENT_LABELS = {"incident_report": "Incident report", "witness_statement": "Witness statement"}
+INCOME_LOSS_EVIDENCE = {
+    "work_incapacity_evidence": "Evidence of time unable to work",
+    "earnings_evidence": "Evidence of earnings",
+}
+INCOME_LOSS = re.compile(
+    r"\b(?:loss[ -]+of|lost|foregone|forgone)[ -]+(?:net |daily )?(?:income|earnings|wages|salary|pay)\b"
+    r"|\b(?:income|earnings|wage|salary)[ -]+loss\b|\b(?:unpaid|missed) (?:work ?days?|shifts?)\b", re.I,
+)
 DRUNK_DRIVING_EXCLUSION = "Repair damage while the insured vehicle was driven under the influence of alcohol, as substantiated by the police report."
 COST_DOCUMENT_TYPES = {
     "theft": ("vehicle_valuation", "Itemised vehicle valuation"),
@@ -18,7 +27,6 @@ REQUIRED_CHECKS = {
     "policy_id": "policy_lookup",
     "loss_date": "policy_period",
     "registration": "vehicle_match",
-    "vehicle.chassis_number": "vehicle_match",
     "loss_type": "loss_and_costs",
     "narrative": "loss_and_costs",
     "gross_amount": "loss_and_costs",
@@ -28,6 +36,8 @@ REQUIRED_CHECKS = {
     "repair_estimate.garage_address": "loss_and_costs",
     "vehicle_valuation": "loss_and_costs",
     "third_party_demand": "loss_and_costs",
+    "motor_benefit_receipt": "loss_and_costs",
+    "motor_benefit_receipt.payment_status": "loss_and_costs",
     "police_report": "loss_and_costs",
     "incident_report": "loss_and_costs",
     "witness_statement": "loss_and_costs",
@@ -37,6 +47,7 @@ REQUIRED_CHECKS = {
     "total": "loss_and_costs",
     "line_items": "loss_and_costs",
     "additional_costs": "loss_and_costs",
+    **dict.fromkeys(INCOME_LOSS_EVIDENCE, "loss_and_costs"),
 }
 
 
@@ -102,6 +113,10 @@ def additional_charge_totals(claim):
     return totals
 
 
+def cost_line_total(line_items, *, initial=Decimal(0)):
+    return sum((Decimal(item["amount"]) for item in line_items), initial)
+
+
 def additional_charge_receipts(claim, category):
     return [doc for doc in claim.get("documents", ())
             if doc.get("type") == "additional_cost_receipt" and doc.get("category") == category]
@@ -119,6 +134,28 @@ def required_gap(field, document, location, reason):
             "required_for": REQUIRED_CHECKS[field]}
 
 
+def missing_income_loss_evidence(claim, coverage_items):
+    if claim.get("loss_type") != "third_party_injury" or any(
+            item["outcome"] == "not_covered" and INCOME_LOSS.search(item["item"]) for item in coverage_items):
+        return []
+    documents = claim.get("documents") or []
+    amount = sum((Decimal(item["amount"]) for doc in documents if doc.get("type") == "third_party_demand"
+                  for item in doc.get("line_items") or [] if item.get("amount") not in (None, "")
+                  and INCOME_LOSS.search(item.get("description") or "")), Decimal(0))
+    if amount <= 0:
+        return []
+    attached = {doc.get("type") for doc in documents} | {
+        doc.get("document_type") for doc in claim.get("uploaded_evidence") or [] if doc.get("status") == "extracted"
+    }
+    demand = f"The third-party demand claims {claim['currency']} {amount:,.2f} for lost income."
+    explanations = {
+        "work_incapacity_evidence": "Provide a medical certificate or other evidence showing how long the injury prevented work.",
+        "earnings_evidence": "Provide pay records, an employer or client statement, or other records showing the earnings rate and income lost.",
+    }
+    return [required_gap(field, label, "Third-party demand", f"{demand} {explanations[field]}")
+            for field, label in INCOME_LOSS_EVIDENCE.items() if field not in attached]
+
+
 def required_claimant_gaps(details):
     gaps = []
     for gap in details.get("missing", []):
@@ -126,6 +163,13 @@ def required_claimant_gaps(details):
         # Before required_for was persisted, these fields were recorded by the same required checks.
         if check and gap.get("required_for", check) == check and gap.get("document") and gap.get("reason"):
             gaps.append(gap)
+    if details.get("coverage_status") not in {"INACTIVE", "NOT_COVERED"} and (assessment := details.get("third_party_assessment")):
+        evidence_gaps = [*assessment["liability"]["evidence_requests"],
+                         *(request for cost in assessment["costs"] if cost["policy_applicability"] in {"applies", "unresolved"}
+                           for request in cost["evidence_requests"])]
+        if total_gap := assessment.get("total_evidence_request"):
+            evidence_gaps.append(total_gap)
+        gaps.extend(gap for gap in evidence_gaps if gap["owner"] == "claimant")
     return gaps
 
 

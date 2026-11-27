@@ -14,10 +14,10 @@ from sqlalchemy import func, select
 
 from backend.storage.sqlite_store import Assessment, Claim, History, Policy, digest
 from backend.assurance.execution_manifest import execution_manifest
-from backend.evidence.approved_claim_history import ApprovedClaimHistory
+from backend.evidence.claim_history import ClaimHistory
 
 
-class FixtureHistory(ApprovedClaimHistory):
+class FixtureHistory(ClaimHistory):
     """Fixed comparables for isolated test databases and scripted debugging."""
 
     def records(self, session, claim):
@@ -106,6 +106,8 @@ def make_fixture(seed: int, index: int, scenario: str):
             {"description": "Replacement parts", "amount": str(amount * Decimal("0.6"))},
             {"description": "Labour and installation", "amount": str(amount * Decimal("0.4"))},
         ]}]
+        if scenario == "insufficient_history":
+            row["documents"][0]["line_items"] = []
     return claim, policy, history
 
 

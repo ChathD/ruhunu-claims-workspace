@@ -2,7 +2,6 @@
 import base64
 import copy
 import json
-import unittest
 from unittest.mock import patch
 
 from sqlalchemy import select
@@ -22,15 +21,7 @@ def analysis(references, provider_args):
         "review_reasons": [], "evidence": references, **scripted_analysis_fields(stage, json.loads(messages[0]["content"]))}}]}
 
 
-class ModelToolTests(unittest.TestCase):
-    def setUp(self):
-        self.fixture = fixtures.AgenticTests()
-        self.fixture.setUp()
-        self.store = self.fixture.store
-
-    def tearDown(self):
-        self.fixture.tearDown()
-
+class ModelToolTests(fixtures.AgenticFixtureTestCase):
     def make_manual(self, identifier):
         with self.store.session.begin() as session:
             row = session.get(Assessment, identifier)
@@ -94,6 +85,93 @@ class ModelToolTests(unittest.TestCase):
                     after = session.scalars(select(ToolCall.id).where(ToolCall.assessment_id == identifier,
                         ToolCall.stage == f"r{number}:{role}")).all()
                 self.assertEqual(after, before)
+
+    def test_coverage_and_fraud_lookup_use_the_saved_vehicle_and_loss_date(self):
+        identifier = self.fixture.prepare()
+        with self.store.session.begin() as session:
+            assessment = session.get(Assessment, identifier)
+            assessment.context = {**assessment.context, "selected_policy": {"id": "wording"}}
+            claim = session.get(Claim, assessment.claim_id)
+            claim.payload = {**claim.payload, "loss_type": "repair", "loss_date": "2026-11-12",
+                             "vehicle": {"make": "Toyota", "model": "Aqua", "year": 2019}}
+            claim.payload_hash = digest(claim.payload)
+        name = "retrieve_vehicle_market_value"
+        with patch("backend.evidence.specialist_evidence_tools.lookup_vehicle_market_value", return_value={"status": "no_observation"}) as lookup:
+            results = {stage: build_tools(self.store, identifier, stage)[name].invoke({}) for stage in ("coverage", "fraud_initial")}
+        query = {"make": "Toyota", "model": "Aqua", "year": 2019, "as_of": "2026-11-12"}
+        self.assertEqual([call.args[0].model_dump(mode="json") for call in lookup.call_args_list], [query, query])
+        self.assertNotIn(name, build_tools(self.store, identifier, "intake"))
+        with self.store.session() as session:
+            calls = session.scalars(select(ToolCall).where(ToolCall.assessment_id == identifier, ToolCall.tool == name)).all()
+            self.assertEqual({call.stage: call.response for call in calls}, results)
+            self.assertTrue(all(call.request == query for call in calls))
+
+    def test_fraud_automatically_compares_market_price_without_escalating_price_alone(self):
+        identifier = self.fixture.prepare()
+        with self.store.session.begin() as session:
+            claim = session.get(Claim, session.get(Assessment, identifier).claim_id)
+            claim.payload = {**claim.payload, "loss_type": "theft", "gross_amount": "4000000.00", "currency": "LKR",
+                             "loss_date": "2026-11-12", "vehicle": {"make": "Toyota", "model": "Aqua", "year": 2019},
+                             "documents": [{"type": "vehicle_valuation", "name": "Vehicle valuation", "total": "4200000.00"}]}
+            claim.payload_hash = digest(claim.payload)
+
+        name = "retrieve_vehicle_market_value"
+        benchmark = {"status": "found", "asking_price_lkr": "2000000", "observation_date": "2026-11-10"}
+
+        def provider(*args):
+            required = json.loads(args[4][0]["content"])["required_checks"]
+            [lookup] = required["supporting_evidence"]
+            self.assertEqual(lookup["tool"], name)
+            self.assertNotIn(name, {tool["name"] for tool in args[5]})
+            source = lookup["result"]["evidence_ref"]
+            self.assertEqual(required["result"]["details"]["vehicle_market_check"]["evidence_ref"], source)
+            result = analysis([required["evidence_ref"]], args)
+            result["content"][0]["input"]["fraud_concerns"] = [{
+                "severity": "high", "basis": "conflicting_evidence", "reason": "The valuation exceeds the average asking price.",
+                "evidence": [source], "observed_facts": [{"path": "submission:/documents/0/total", "value": "4200000.00"},
+                                                          {"path": source + ":/asking_price_lkr", "value": "2000000"}],
+            }]
+            return result
+
+        with patch("backend.evidence.specialist_evidence_tools.lookup_vehicle_market_value", return_value=benchmark) as lookup, \
+                patch.object(agentic, "call_model", side_effect=provider):
+            finding = agentic.run_specialist(self.store, identifier, self.context(), 1, "fraud", "Assess")
+        lookup.assert_called_once()
+        details = finding["details"]
+        self.assertEqual(details["vehicle_market_check"]["comparisons"], [{
+            "label": "Vehicle valuation", "amount_lkr": "4200000.00", "percent_of_benchmark": "210.0",
+            "source": "submission:/documents/0/total",
+        }])
+        self.assertIn(details["vehicle_market_check"]["evidence_ref"], finding["evidence"])
+        self.assertEqual(details["fraud_concerns"], [])
+        self.assertEqual(finding["status"], "pass")
+        self.assertIn("average advertised asking price", finding["summary"])
+        self.assertNotIn(name, build_tools(self.store, identifier, "fraud_followup",
+                                           context_snapshot={"findings": {"fraud_initial": finding}}))
+
+    def test_fraud_skips_market_lookup_without_a_usable_valuation_document(self):
+        identifier = self.fixture.prepare()
+
+        def provider(*args):
+            required = json.loads(args[4][0]["content"])["required_checks"]
+            self.assertEqual(required["supporting_evidence"], [])
+            return analysis([required["evidence_ref"]], args)
+
+        with patch("backend.evidence.specialist_evidence_tools.lookup_vehicle_market_value") as lookup, \
+                patch.object(agentic, "call_model", side_effect=provider):
+            for number, documents in enumerate(([], [{"type": "vehicle_valuation", "total": None}],
+                                                [{"type": "independent_assessor_report", "assessed_amount_lkr": "4200000.00"}]), 1):
+                with self.subTest(documents=documents):
+                    with self.store.session.begin() as session:
+                        claim = session.get(Claim, session.get(Assessment, identifier).claim_id)
+                        claim.payload = {**claim.payload, "loss_type": "theft", "gross_amount": "4000000.00", "currency": "LKR",
+                                         "loss_date": "2026-11-12", "vehicle": {"make": "Toyota", "model": "Aqua", "year": 2019},
+                                         "documents": documents}
+                        claim.payload_hash = digest(claim.payload)
+                    finding = agentic.run_specialist(self.store, identifier, self.context(), number, "fraud", "Assess")
+                    self.assertTrue(finding["details"]["checks_executed"])
+                    self.assertNotIn("vehicle_market_check", finding["details"])
+            lookup.assert_not_called()
 
     def test_parallel_checks_supply_exact_audited_evidence_without_context_bloat(self):
         identifier = self.fixture.prepare(14)

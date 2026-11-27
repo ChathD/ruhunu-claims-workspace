@@ -14,7 +14,7 @@ from backend.agents import claude_investigation as agentic
 from backend.agents.specialist_preflight import apply_verified_controls, finish_offline_checks
 from backend.evidence.uploaded_claim_documents import cost_documents_from_extractions
 from backend.claim_schemas import Finding
-from backend.storage.sqlite_store import Assessment, Claim, History, Store, digest
+from backend.storage.sqlite_store import Account, Adjudication, Assessment, Claim, DecisionRecord, FraudRoutingCorrection, History, Store, digest
 from backend.evidence.specialist_evidence_tools import build_tools
 
 
@@ -23,6 +23,55 @@ def tools_for(**responses):
 
 
 class ContextTests(unittest.TestCase):
+    def test_comparables_use_prior_published_decisions_regardless_of_staff_review(self):
+        submitted_at = "2026-10-21T00:00:00+00:00"
+        prior_received = "2026-10-19T00:00:00+00:00"
+        prior_decision = "2026-10-20T00:00:00+00:00"
+        cases = [
+            ("unreviewed", prior_received, "complete", prior_decision),
+            ("rejected", prior_received, "complete", prior_decision),
+            ("late-decision", prior_received, "complete", "2026-10-22T00:00:00+00:00"),
+            ("no-decision", prior_received, "complete", None),
+            ("processing", prior_received, "processing", None),
+            ("current", submitted_at, "processing", None),
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            store = Store(Path(folder) / "claims.sqlite3")
+            try:
+                with store.session.begin() as session:
+                    for sequence, (identifier, received_at, status, decision_at) in enumerate(cases, 1):
+                        payload, _, _ = make_fixture(42, sequence, "ordinary_repair")
+                        session.add(Claim(id=payload["claim_id"], sequence=sequence, batch_id="test", policy_id=payload["policy_id"],
+                                          received_at=received_at, payload=payload, payload_hash=digest(payload)))
+                        session.flush()
+                        session.add(Assessment(id=identifier, claim_id=payload["claim_id"], status=status, execution={}))
+                        session.flush()
+                        if decision_at:
+                            decision = {"route": "adjuster review"}
+                            session.add(DecisionRecord(assessment_id=identifier, payload=decision,
+                                                       payload_hash=digest(decision), created_at=decision_at))
+                    session.add(Account(id="reviewer", email="reviewer@test.local", password_hash="disabled", role="staff"))
+                    session.flush()
+                    session.add(Adjudication(assessment_id="rejected", reviewer_id="reviewer", outcome="rejected",
+                                             reason="Staff reviewed the claim", created_at=prior_decision))
+                    session.add(Adjudication(assessment_id="unreviewed", reviewer_id="reviewer", outcome="approved",
+                                             reason="Staff reviewed after the current claim arrived", created_at="2026-10-22T00:00:00+00:00"))
+                    correction = {"route": "fraud escalation", "reason_codes": ["FRAUD_INDICATOR"], "justification": "Verified evidence reuse."}
+                    session.add(FraudRoutingCorrection(assessment_id="rejected", payload=correction, payload_hash=digest(correction),
+                                                       original_decision_hash=digest({"route": "adjuster review"}), created_at=prior_decision))
+
+                records = build_tools(store, "current", "historical")["retrieve_comparable_claims"].invoke({})["records"]
+                self.assertEqual({record["assessment_id"] for record in records}, {"unreviewed", "rejected"})
+                by_assessment = {record["assessment_id"]: record for record in records}
+                self.assertEqual(by_assessment["rejected"]["triage_decision"]["route"], "fraud escalation")
+                self.assertEqual(by_assessment["rejected"]["staff_decision"]["outcome"], "rejected")
+                self.assertIsNone(by_assessment["unreviewed"]["staff_decision"])
+                for record in records:
+                    self.assertEqual(record["decision_published_at"], prior_decision)
+                    self.assertTrue(record["documents"][0]["line_items"])
+            finally:
+                store.engine.dispose()
+
     def test_scoped_tools_use_frozen_findings_and_version(self):
         with tempfile.TemporaryDirectory() as folder:
             store = Store(Path(folder) / "claims.sqlite3")
@@ -82,6 +131,40 @@ class ContextTests(unittest.TestCase):
         apply_verified_controls("fraud", result, {}, {})
         self.assertEqual(result.status, "pass")
         self.assertEqual(result.details["fraud_indicators"], [])
+
+    def test_fraud_requires_cited_independent_text_and_excludes_missing_report_markers(self):
+        fnol = "submission:/unstructured_inputs/fnol_transcript"
+        police = "submission:/unstructured_inputs/police_report_ocr"
+        estimate = "submission:/unstructured_inputs/repair_estimate_text"
+        presented = {"submission": {
+            "narrative": "Only the rear bumper was damaged.",
+            "unstructured_inputs": {
+                "fnol_transcript": "Caller: Only the rear bumper was damaged.",
+                "police_report_ocr": "No police report submitted.\n\n--- Next document ---\n\nWitness statement\nReport: Front door was damaged.",
+                "repair_estimate_text": "Motor repair quotation\nTotal: LKR 120,000.00",
+            },
+            "documents": [{"type": "repair_estimate", "total": "120000.00"}],
+        }}
+
+        def concern(left, right):
+            return {"basis": "conflicting_evidence", "evidence": [fnol, police, estimate],
+                    "observed_facts": [{"path": path, "value": value} for path, value in (left, right)]}
+
+        supported = concern((fnol, "Only the rear bumper was damaged."), (police, "Front door was damaged."))
+        duplicate = concern((estimate, "LKR 120,000.00"), ("submission:/documents/0/total", "120000.00"))
+        missing = concern((fnol, "Only the rear bumper was damaged."), (police, "No police report submitted."))
+        uncited = {**supported, "evidence": [fnol]}
+        self.assertEqual(fraud.supported_concerns([duplicate, supported, missing, uncited], presented), [supported])
+
+    def test_fraud_does_not_use_a_fictional_policy_number_or_distinct_claim_dates_as_conflicts(self):
+        diary = "submission:/unstructured_inputs/adjuster_notes"
+        presented = {"submission": {"policy_id": "TEST-REF-8", "loss_date": "2025-10-15", "reported_date": "2025-10-19",
+                                     "unstructured_inputs": {"adjuster_notes": "Policy TEST-REF-8. Notice recorded."}}}
+        number = {"basis": "conflicting_evidence", "evidence": [diary], "observed_facts": [
+            {"path": diary, "value": "Policy TEST-REF-8."}, {"path": "submission:/loss_date", "value": "2025-10-15"}]}
+        dates = {"basis": "conflicting_evidence", "evidence": [diary], "observed_facts": [
+            {"path": "submission:/loss_date", "value": "2025-10-15"}, {"path": "submission:/reported_date", "value": "2025-10-19"}]}
+        self.assertEqual(fraud.supported_concerns([number, dates], presented, fictional_policy_reference=True), [])
 
     def test_followup_fraud_depends_on_verified_historical_leads(self):
         lead = {"document_reference": "EST-1", "history_ids": ["H1", "H2"], "alternative": "Clerical error"}
@@ -156,8 +239,10 @@ class ContextTests(unittest.TestCase):
         def capture(*args):
             captured.append(json.loads(args[4][0]["content"]))
             raise RuntimeError("Stop before any provider request")
-        def build_scoped_tools(*args, on_result, **kwargs):
+        def build_scoped_tools(_store, _identifier, stage, *, on_result, **kwargs):
             on_result("read_submission", {}, {"source": "Synthetic generator"})
+            if stage == "historical":
+                on_result("retrieve_comparable_claims", {}, {"records": []})
             return {}
         checked = Finding(agent="test", status="pass", summary="Checked", evidence=[])
         with patch.object(agentic, "build_tools", side_effect=build_scoped_tools), \

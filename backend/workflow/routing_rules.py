@@ -2,12 +2,16 @@
 from decimal import Decimal
 
 from backend.agents.fraud_specialist import high_severity_concerns, screened_finding
+from backend.assurance.investigation_display import SELECTED_COVERAGE_REVIEW_CODES, coverage_outcome, selected_review_summary
 from backend.claim_schemas import AUTHORITY, Decision, Route
 from backend.evidence.required_claim_evidence import committed_required_gaps
+from backend.evidence.third_party_assessment import supported_payable
+from backend.workflow.versions import V4
 
 
-def information_requests(findings):
-    requests = [(gap["document"], gap.get("location"), gap["reason"]) for gap in committed_required_gaps(findings)]
+def information_requests(findings, summary_requests=()):
+    requests = [(gap["document"], gap.get("location"), gap["reason"])
+                for gap in (*committed_required_gaps(findings), *summary_requests)]
     return [{"document": document, "location": location, "reason": reason}
             for document, location, reason in dict.fromkeys(requests)]
 
@@ -20,17 +24,28 @@ def select_route(claim, context, finding_ids):
     coverage = findings.get("coverage", {})
     historical = findings.get("historical", {})
     gross = Decimal(claim["gross_amount"])
-    payable = coverage.get("details", {}).get("financial", {}).get("payable")
+    coverage_details = coverage.get("details", {})
+    coverage_status = coverage_details.get("coverage_status")
+    outcome = coverage_details.get("coverage_outcome") or coverage_outcome(coverage_details, context.get("selected_policy"))
+    third_party = coverage_details.get("third_party_assessment")
+    payable = coverage_details.get("financial", {}).get("payable")
+    scheduled_repair = coverage_details.get("scheduled_repair_verified") is True and payable is not None
+    if context.get("workflow") == V4 or (third_party is not None and (
+            coverage_status != "COVERED" or not supported_payable(third_party))):
+        payable = None
     readiness_gaps = context.get("readiness_gaps", [])
-    missing = information_requests(findings)
-    coverage_status = coverage.get("details", {}).get("coverage_status")
+    recommendation = context.get("recommendation") or {}
+    summary_requests = (recommendation.get("evidence_requests", [])
+                        if third_party is None and coverage_status not in {"INACTIVE", "NOT_COVERED"} else [])
+    missing = information_requests(findings, summary_requests)
     leads = historical.get("details", {}).get("fraud_investigation", {}).get("leads", [])
-    required_stages = ["intake", "fraud_initial", "coverage", "historical"]
+    required_stages = ["intake", "fraud_initial", "coverage"]
+    if not scheduled_repair or context.get("historical_available") is not False:
+        required_stages.append("historical")
     if leads:
         required_stages.append("fraud_followup")
     complete = all(findings.get(stage, {}).get("status") == "pass"
                    and findings[stage]["details"].get("checks_executed") for stage in required_stages)
-    coverage_details = coverage.get("details", {})
     wording_conflicts = [item for item in coverage_details.get("policy_conflicts", [])
                          if item["materiality"] in {"material", "uncertain"}]
     if context.get("synthetic_wording_document_id"):
@@ -61,18 +76,20 @@ def select_route(claim, context, finding_ids):
     elif wording_conflicts:
         route, code, reason = Route.REVIEW, "POLICY_WORDING_CONFLICT", "The adjuster must reconcile the wording and the saved policy terms. " + " ".join(
             f"{item['item']}. {item['impact']}" for item in wording_conflicts)
-    elif any(f["status"] == "review" for f in findings.values()) or coverage_status in {"INACTIVE", "NOT_COVERED", "UNRESOLVED"}:
+    elif context.get("selected_policy") and coverage_status == "COVERED" and not scheduled_repair:
+        route, code, reason = Route.REVIEW, "POLICY_SCHEDULE_REVIEW", "Staff must confirm the individual policy schedule and payable amount after the wording assessment."
+    elif (any(f["status"] == "review" for f in findings.values()) or outcome["state"] == "partially_confirmed"
+          or coverage_status in {"INACTIVE", "NOT_COVERED", "UNRESOLVED"}):
         route, code, reason = Route.REVIEW, "SPECIALIST_REVIEW", "A specialist identified an unresolved coverage, valuation or operational concern requiring an adjuster."
     elif coverage_status == "NEEDS_INFORMATION":
         route, code, reason = Route.REVIEW, "UNSPECIFIED_EVIDENCE_GAP", "The coverage check did not identify what the claimant needs to supply."
-    elif context.get("historical_available") is False:
-        route, code, reason = Route.REVIEW, "NO_COMPARABLE_HISTORY", "No eligible staff-approved claims were available for a cost comparison. An adjuster must validate the claimed amount."
+    elif context.get("historical_available") is False and not scheduled_repair:
+        route, code, reason = Route.REVIEW, "NO_COMPARABLE_HISTORY", "No eligible earlier claims were available for a cost comparison. An adjuster must validate the claimed amount."
     elif (not complete or coverage_status != "COVERED" or payable is None or Decimal(payable) <= 0 or gross <= 0
-          or historical.get("details", {}).get("amount_justification", {}).get("conclusion") != "SUPPORTED"):
+          or (not scheduled_repair and historical.get("details", {}).get("amount_justification", {}).get("conclusion") != "SUPPORTED")):
         route, code, reason = Route.REVIEW, "INCOMPLETE_CHECKS", "Required checks or a supported positive payable are not available."
     else:
         route, code, reason = Route.AUTO, "PROVISIONAL_CHECKS_PASSED", "All configured synthetic checks passed within provisional automated authority. This triage outcome does not authorize payment."
-    recommendation = context.get("recommendation")
     proposed = recommendation.get("route") if recommendation else None
     if route == Route.AUTO:
         if proposed == Route.REVIEW.value:
@@ -86,10 +103,15 @@ def select_route(claim, context, finding_ids):
     override = reason if recommendation and recommendation.get("route") != route.value else None
     if claim.get("source") == "Manual submission" and route in {Route.AUTO, Route.REVIEW}:
         route, code = Route.REVIEW, "MANUAL_STAFF_DECISION"
-        reason = "Manual claim investigation completed; an authenticated staff member must record the final decision. " + reason
+        reason = "Manual claim investigation completed and requires adjuster review. " + reason
         override = reason if recommendation and recommendation.get("route") != route.value else None
+    selected = context.get("selected_policy")
+    if selected and route == Route.REVIEW and code in SELECTED_COVERAGE_REVIEW_CODES:
+        reason = selected_review_summary(context, claim)
+        if override:
+            override = reason
     rationale = [reason]
-    if high_severity:
+    if high_severity and not selected:
         rationale.extend(dict.fromkeys(concern["reason"] for concern in high_severity))
     if missing:
         items = []
@@ -99,7 +121,7 @@ def select_route(claim, context, finding_ids):
         rationale.append("Missing information and why it is needed\n" + "\n".join(items))
     if route == Route.INFO and claim["currency"] == "LKR" and gross > AUTHORITY:
         rationale.append("An adjuster must oversee this claim because its gross amount exceeds LKR 250,000 before deductibles.")
-    if route != Route.INFO:
+    if route != Route.INFO and not selected:
         rationale.extend(f"{stage}: {f['summary']} Evidence: {', '.join(f['evidence'])}" for stage, f in findings.items())
         rationale.extend(f"{stage}: not assessed — {explanation}" for stage, explanation in context.get("skipped", {}).items())
         if recommendation:
@@ -107,4 +129,4 @@ def select_route(claim, context, finding_ids):
     return Decision(route=route, justification="\n\n".join(rationale), reason_codes=[code], gross_amount=gross,
                     payable_amount=Decimal(payable) if payable is not None and route != Route.INFO else None,
                     information_required=missing,
-                    finding_ids=finding_ids, context_version=context["version"], recommendation=recommendation, override_reason=override)
+                    finding_ids=finding_ids, context_version=context["version"], recommendation=recommendation or None, override_reason=override)

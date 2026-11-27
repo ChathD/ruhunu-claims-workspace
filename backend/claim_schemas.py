@@ -36,6 +36,15 @@ class Route(str, Enum):
     FRAUD = "fraud escalation"
 
 
+ScenarioRoute = Literal["auto_approval", "adjuster_review", "need_information", "fraud_escalation"]
+SCENARIO_ROUTES: dict[ScenarioRoute, Route] = {
+    "auto_approval": Route.AUTO,
+    "adjuster_review": Route.REVIEW,
+    "need_information": Route.INFO,
+    "fraud_escalation": Route.FRAUD,
+}
+
+
 class Finding(BaseModel):
     model_config = ConfigDict(extra="forbid")
     agent: str
@@ -45,13 +54,8 @@ class Finding(BaseModel):
     details: dict = Field(default_factory=dict)
 
 
-class GenerateRequest(BaseModel):
-    count: int = Field(default=16, ge=1, le=160)
-
-
 class ClaimPreviewRequest(BaseModel):
-    policy_id: str = Field(min_length=1, max_length=64)
-    count: int = Field(ge=1, le=10)
+    count: Literal[1] = 1
 
 
 class AcknowledgeRequest(BaseModel):

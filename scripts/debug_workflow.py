@@ -43,10 +43,9 @@ def scripted_analysis_fields(stage, model_input):
                  and (amount := historical.cost_document_amount(row)) is not None]
         current = historical.cost_document_amount(claim)
         conclusion = "INSUFFICIENT_EVIDENCE"
-        if len(costs) >= 5 and current is not None:
+        if costs and current is not None:
             conclusion = "REQUIRES_REVIEW" if current > 2 * median(costs) else "SUPPORTED"
-        return {"amount_conclusion": conclusion, "comparable_claim_ids": comparable_ids,
-                "history_leads": historical.reference_leads(claim, records)}
+        return {"amount_conclusion": conclusion, "comparable_claim_ids": comparable_ids}
     return {}
 
 

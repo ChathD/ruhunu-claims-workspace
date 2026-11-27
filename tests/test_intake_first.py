@@ -13,14 +13,10 @@ from backend.assurance.investigation_display import completed_model_assignments
 from scripts.debug_workflow import scripted_readiness
 
 
-class IntakeFirstTests(unittest.TestCase):
+class IntakeFirstTests(fixtures.AgenticFixtureTestCase):
     def setUp(self):
-        self.fixture = fixtures.AgenticTests()
-        self.fixture.setUp()
-        self.store, self.workflow = self.fixture.store, self.fixture.workflow
-
-    def tearDown(self):
-        self.fixture.tearDown()
+        super().setUp()
+        self.workflow = self.fixture.workflow
 
     def prepare(self, index=0):
         identifier = self.fixture.prepare(index)
@@ -241,6 +237,18 @@ class ReadinessValidationTests(unittest.TestCase):
         bad["tasks"] = []
         with self.assertRaisesRegex(ValueError, "match READY"):
             readiness.validate_selection(bad, self.context, self.claim)
+
+    def test_live_readiness_dispatches_valid_tasks_before_requesting_information(self):
+        draft = readiness.Selection.model_validate({**self.plan, "next_action": "REQUEST_INFORMATION"})
+
+        def structured_call(*args, validate_result, **kwargs):
+            validate_result(draft)
+            return draft
+
+        with patch.object(readiness.agentic, "structured_call", side_effect=structured_call):
+            result = readiness.assess(None, "fixture", self.context, self.claim, 1)
+        self.assertEqual(result["next_action"], "DISPATCH")
+        self.assertEqual(result["tasks"], self.plan["tasks"])
 
     def test_completed_checks_cannot_be_repeated(self):
         self.context["findings"]["coverage"] = {"details": {"checks_executed": True, "coverage_status": "COVERED"}}

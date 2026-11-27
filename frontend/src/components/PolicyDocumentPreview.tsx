@@ -24,7 +24,7 @@ export default function PolicyDocumentPreview({ document, onClose }: {
         const response = await fetch(`/api/policy-documents/${document.id}/original`, { signal: controller.signal });
         if (!response.ok) {
           if (response.status === 401) throw new Error("Please sign in again to view this document.");
-          if (response.status === 403) throw new Error("Administrator access is required to view policy documents.");
+          if (response.status === 403) throw new Error("Your account cannot view this policy document.");
           if (response.status === 404) throw new Error("This document could not be found. Close the preview and refresh the document list.");
           throw new Error(`Unable to load this document (HTTP ${response.status}).`);
         }
@@ -48,14 +48,17 @@ export default function PolicyDocumentPreview({ document, onClose }: {
   return <dialog ref={dialogRef} className="claim-detail-dialog policy-document-preview" aria-labelledby="policy-preview-title"
     onCancel={e => { e.preventDefault(); onClose(); }}>
     <header className="claim-dialog-header">
-      <div><div className="eyebrow">POLICY DOCUMENT</div><h2 id="policy-preview-title">{document.title}</h2><p>{document.filename}</p></div>
-      <button type="button" autoFocus className="button secondary" onClick={onClose}>Close <span aria-hidden="true">×</span></button>
+      <h2 id="policy-preview-title">{document.title}</h2>
+      <button type="button" autoFocus onClick={onClose}>Close</button>
     </header>
     <div className="policy-preview-body">
       {error ? <p role="alert">{error}</p> : !preview ? <p role="status">Loading document…</p> : preview.url ?
         <iframe src={preview.url} title={`${document.title} PDF preview`} onError={() => setError("The PDF preview could not load. You can download the original below.")} /> :
         <pre className="policy-preview-text">{preview.text}</pre>}
     </div>
-    <footer className="policy-preview-footer"><span>Original policy document</span><a className="button secondary" href={`/api/policy-documents/${document.id}/original`}>Download original</a></footer>
+    <footer className="policy-preview-footer actions">
+      {preview?.url && <a href={`/api/policy-documents/${document.id}/preview`} target="_blank" rel="noreferrer">Open PDF in new tab</a>}
+      <a href={`/api/policy-documents/${document.id}/original`}>Download original</a>
+    </footer>
   </dialog>;
 }

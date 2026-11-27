@@ -1,22 +1,30 @@
-"""Serve account, manual claim, claimant status and staff adjudication routes."""
+"""Serve staff claim investigations and administrator routes."""
 import base64
 import hashlib
 import hmac
 import secrets
 import uuid
-import threading
-from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
-from typing import Literal
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
-from backend.storage.sqlite_store import Account, Adjudication, Assessment, Attachment, Claim, DecisionRecord, FraudRoutingCorrection, InvestigationRevision, LoginSession, Ownership, Policy, ToolCall, digest
-from backend.assurance.execution_manifest import execution_manifest
-from backend.claim_schemas import AdditionalCost, Money, MotorLossType, Route, VehicleEvidence
-from backend.assurance.investigation_display import completed_model_assignments, display_finding
+from backend.storage.postgres import begin_write
+from backend.storage.sqlite_store import Account, Adjudication, Assessment, Attachment, Claim, ClaimArchive, DecisionRecord, FraudRoutingCorrection, InvestigationRevision, LoginSession, ToolCall, WorkflowEvent
+from backend.claim_schemas import Route
+from backend.assurance.investigation_display import (
+    adjuster_review_brief, completed_model_assignments, display_finding, fraud_escalation_brief, fraud_identification_brief,
+    settlement_review_reasons, staff_justification,
+)
+from backend.assurance.investigation_pdf import render_investigation_pdf
+from backend.assurance.pdf_preview import pdf_page_previews
+from backend.assurance.policy_schedule_preview import policy_schedule_preview
+from backend.assurance.routing_evaluation import evaluate
+from backend.assurance.synthetic_dataset import generated_scenario_title
+from backend.evidence.vehicle_market_value import VehicleMarketQuery, lookup_vehicle_market_value
 from backend.workflow.investigation_retry import can_reprocess, failure_reason, interrupted_attention, queue_reprocessing
 
 
@@ -32,35 +40,11 @@ class Credentials(BaseModel):
 
 
 class AccountInput(Credentials):
-    role: Literal["user", "staff", "admin"] = "user"
-
-
-class Upload(BaseModel):
-    name: str = Field(min_length=1, max_length=150)
-    media_type: Literal["application/pdf", "image/png", "image/jpeg"]
-    content: str = Field(max_length=2800000)
-
-
-class ManualClaim(BaseModel):
-    policy_id: str = Field(min_length=1, max_length=100)
-    registration: str = Field(min_length=1, max_length=40)
-    vehicle: VehicleEvidence | None = None
-    loss_type: MotorLossType | Literal["glass", "injury", "other"]
-    loss_date: date
-    gross_amount: Money
-    additional_costs: list[AdditionalCost] = Field(default_factory=list, max_length=10)
-    narrative: str = Field(min_length=10, max_length=5000)
-    attachments: list[Upload] = Field(default_factory=list, max_length=5)
-
-
-class Review(BaseModel):
-    outcome: Literal["approved", "rejected"]
-    reason: str = Field(min_length=10, max_length=3000)
+    role: Literal["staff"] = "staff"
 
 
 def install_portal(app, store):
     router = APIRouter(prefix="/api")
-    revision_lock = threading.Lock()
 
     def create_account(email, password, role):
         email = email.strip().lower()
@@ -77,24 +61,35 @@ def install_portal(app, store):
         empty = session.scalar(select(func.count()).select_from(Account)) == 0
     if empty:
         # Explicit development accounts; bind this demo to loopback only.
-        for role in ["admin", "staff", "user"]:
+        for role in ("admin", "staff"):
             create_account(f"{role}@ruhunu.local", f"{role.capitalize()}Demo!2026", role)
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
-        from fastapi.responses import JSONResponse
-        path = request.url.path
-        public = path in {"/api/health", "/api/auth/login", "/api/auth/register"}
+        path = request.url.path.rstrip("/")
+        public = path in {"/api/health", "/api/auth/login"}
         if path.startswith("/api/") and not public:
             token = request.cookies.get("claims_session", "")
             with store.session() as session:
                 login = session.get(LoginSession, hashlib.sha256(token.encode()).hexdigest()) if token else None
                 actor = session.get(Account, login.account_id) if login and login.expires_at > datetime.now(timezone.utc).isoformat() else None
-            if actor is None:
+            if actor is None or actor.role not in {"admin", "staff"}:
                 return JSONResponse({"detail": "Please sign in"}, status_code=401)
             request.state.actor = actor
-            if not path.startswith(("/api/auth/", "/api/portal/")) and actor.role != "admin":
-                return JSONResponse({"detail": "Administrator access required"}, status_code=403)
+            if not path.startswith(("/api/auth/", "/api/portal/")):
+                policy_documents = path == "/api/policy-documents" or path.startswith("/api/policy-documents/")
+                policy_retry = path.endswith("/retry") and path.rsplit("/", 2)[0] == "/api/policy-documents"
+                policy_remove = request.method == "DELETE" and path.rpartition("/")[0] == "/api/policy-documents"
+                policy_write = request.method == "POST" and (path == "/api/policy-documents" or policy_retry)
+                if policy_write or policy_remove or (policy_documents and request.method in {"GET", "HEAD"}):
+                    roles = {"admin", "staff"}
+                elif policy_documents or path.startswith("/api/policies/"):
+                    roles = {"admin"}
+                else:
+                    roles = {"staff"}
+                if actor.role not in roles:
+                    detail = "Administrator access required" if roles == {"admin"} else "Staff access required"
+                    return JSONResponse({"detail": detail}, status_code=403)
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("origin")
             if origin and origin not in {"http://127.0.0.1:5180", "http://localhost:5180", "http://127.0.0.1:8010"}:
@@ -105,17 +100,13 @@ def install_portal(app, store):
     def login(body: Credentials, response: Response):
         with store.session.begin() as session:
             account = session.scalar(select(Account).where(Account.email == body.email.strip().lower()))
-            if not account or not hmac.compare_digest(password_hash(body.password, account.password_hash.split(":")[0]), account.password_hash):
+            if not account or account.role not in {"admin", "staff"} or not hmac.compare_digest(password_hash(body.password, account.password_hash.split(":")[0]), account.password_hash):
                 raise HTTPException(401, "Email or password is incorrect")
             token = secrets.token_urlsafe(32)
             session.add(LoginSession(token_hash=hashlib.sha256(token.encode()).hexdigest(), account_id=account.id,
                                      expires_at=(datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()))
             response.set_cookie("claims_session", token, httponly=True, samesite="strict", max_age=28800)
             return {"id": account.id, "email": account.email, "role": account.role}
-
-    @router.post("/auth/register", status_code=201)
-    def register(body: Credentials):
-        return create_account(body.email, body.password, "user")
 
     @router.get("/auth/me")
     def me(request: Request):
@@ -132,99 +123,37 @@ def install_portal(app, store):
         return {"status": "signed out"}
 
     def require_staff(request):
-        if request.state.actor.role not in {"staff", "admin"}:
+        if request.state.actor.role != "staff":
             raise HTTPException(403, "Staff access required")
+
+    def require_admin(request):
+        if request.state.actor.role != "admin":
+            raise HTTPException(403, "Administrator access required")
 
     @router.get("/portal/accounts")
     def accounts(request: Request):
-        if request.state.actor.role != "admin":
-            raise HTTPException(403, "Administrator access required")
+        require_admin(request)
         with store.session() as session:
-            return [{"id": a.id, "email": a.email, "role": a.role} for a in session.scalars(select(Account))]
+            return [{"id": a.id, "email": a.email, "role": a.role} for a in session.scalars(select(Account).where(Account.role.in_(("admin", "staff"))))]
 
     @router.post("/portal/accounts", status_code=201)
     def add_account(body: AccountInput, request: Request):
-        if request.state.actor.role != "admin":
-            raise HTTPException(403, "Administrator access required")
-        return create_account(body.email, body.password, body.role)
+        require_admin(request)
+        return create_account(body.email, body.password, "staff")
 
-    def enqueue_manual(body: ManualClaim, owner_id: str, parent_id=None, revision=1, parent_claim_id=None):
-        if body.loss_date > date.today() or body.gross_amount <= 0:
-            raise HTTPException(422, "Use a past/present loss date and a positive claimed amount")
-        attachments = []
-        for upload in body.attachments:
-            try:
-                content = base64.b64decode(upload.content, validate=True)
-            except ValueError:
-                raise HTTPException(422, "Invalid attachment encoding")
-            if len(content) > 2 * 1024 * 1024 or not content:
-                raise HTTPException(422, "Each attachment must be nonempty and at most 2 MB")
-            valid = content.startswith(b"%PDF-") if upload.media_type == "application/pdf" else content.startswith(b"\x89PNG\r\n\x1a\n") if upload.media_type == "image/png" else content.startswith(b"\xff\xd8\xff")
-            if not valid:
-                raise HTTPException(422, "Attachment contents do not match the selected file type")
-            attachments.append(upload)
-        identifier, claim_id = str(uuid.uuid4()), str(uuid.uuid4())
-        attachment_ids = [str(uuid.uuid4()) for _ in attachments]
-        payload = {**body.model_dump(mode="json", exclude={"attachments"}), "claim_id": claim_id, "revision": revision,
-                   "currency": "LKR", "source": "Manual submission", "documents": [], "incident_id": str(uuid.uuid4()),
-                   "parent_assessment_id": parent_id,
-                   "parent_claim_id": parent_claim_id,
-                   "attachment_manifest": [{"id": file_id, "name": upload.name, "media_type": upload.media_type} for file_id, upload in zip(attachment_ids, attachments)],
-                   "reported_date": date.today().isoformat()}
-        from backend.model_settings import settings
-        from backend.evidence.policy_wording_index import uploaded_document_ids
-        workflow = "claude-intake-first-v3"
-        execution = {**execution_manifest(), "workflow": workflow, "mode": "anthropic-tools" if settings()[0] else "deterministic-tools"}
-        corpus_ids = uploaded_document_ids(store)
-        with store.session.begin() as session:
-            sequence = (session.scalar(select(func.max(Claim.sequence))) or 0) + 1
-            session.add(Claim(id=claim_id, sequence=sequence, batch_id="manual", policy_id=body.policy_id, payload=payload, payload_hash=digest(payload)))
-            session.flush()
-            context = {"findings": {}, "skipped": {}, "environment": "manual", "version": 0,
-                       "workflow": workflow, "policy_search_mode": "uploaded-corpus", "policy_corpus_ids": corpus_ids}
-            session.add(Assessment(id=identifier, claim_id=claim_id, status="queued", context=context, version=0, execution=execution))
-            session.flush()
-            session.add(Ownership(assessment_id=identifier, account_id=owner_id))
-            for attachment_id, upload in zip(attachment_ids, attachments):
-                session.add(Attachment(id=attachment_id, assessment_id=identifier, **upload.model_dump()))
-            store.add_event(session, identifier, "manual_submitted", {"source": "manual"})
-            if parent_id:
-                session.add(InvestigationRevision(source_id=parent_id, target_id=identifier))
-        if hasattr(app.state, "worker"):
-            app.state.worker.wake.set()
-        return {"id": identifier, "reference": f"CLM-{sequence:04d}"}
-
-    @router.post("/portal/claims", status_code=201)
-    def submit(body: ManualClaim, request: Request):
-        return enqueue_manual(body, request.state.actor.id)
-
-    @router.post("/portal/claims/{identifier}/investigate", status_code=202)
-    def investigate_existing(identifier: str, request: Request):
-        require_staff(request)
-        with revision_lock:
-            with store.session() as session:
-                old = session.get(Assessment, identifier)
-                if old is None:
-                    raise HTTPException(404, "Assessment not found")
-                prior = session.get(InvestigationRevision, identifier)
-                if prior:
-                    return {"id": prior.target_id}
-                claim = session.get(Claim, old.claim_id)
-                if claim.payload.get("source") != "Manual submission" or session.get(Adjudication, identifier):
-                    raise HTTPException(409, "Only manual submissions awaiting a final staff decision can be investigated")
-                if old.execution.get("workflow") == "claude-intake-first-v3" and (old.status in {"queued", "processing"} or old.context.get("findings")):
-                    return {"id": identifier}
-                owner = session.get(Ownership, identifier)
-                files = session.scalars(select(Attachment).where(Attachment.assessment_id == identifier)).all()
-                body = ManualClaim.model_validate({**claim.payload, "attachments": [
-                    {"name": f.name, "media_type": f.media_type, "content": f.content} for f in files]})
-            return enqueue_manual(body, owner.account_id, parent_id=identifier, revision=claim.payload.get("revision", 1) + 1, parent_claim_id=claim.id)
+    @router.get("/portal/evaluation")
+    def routing_evaluation(request: Request, response: Response):
+        require_admin(request)
+        report = evaluate(store, app.state.labels_path)
+        response.headers["Cache-Control"] = "no-store"
+        return {"matrix": report["matrix"], "class_metrics": report["class_metrics"],
+                "evaluated": report["evaluated"], "pending": report["pending"], "mismatches": len(report["errors"])}
 
     @router.post("/portal/claims/{identifier}/retry", status_code=202)
     def retry_investigation(identifier: str, request: Request):
         require_staff(request)
         with store.session.begin() as session:
-            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            begin_write(session)
             assessment = session.get(Assessment, identifier)
             if assessment is None:
                 raise HTTPException(404, "Assessment not found")
@@ -235,89 +164,138 @@ def install_portal(app, store):
         app.state.worker.wake.set()
         return {"id": target, "status": "queued"}
 
-    @router.get("/portal/claims")
-    def list_claims(request: Request):
-        actor = request.state.actor
+    def portal_claim_rows(request, identifier=None, summary=False, overview=False):
+        require_staff(request)
         with store.session() as session:
-            allowed = set(session.scalars(select(Ownership.assessment_id).where(Ownership.account_id == actor.id)))
             rows = []
-            for assessment in session.scalars(select(Assessment)):
-                if actor.role == "user" and assessment.id not in allowed:
-                    continue
-                claim = session.get(Claim, assessment.claim_id)
-                decision = session.get(FraudRoutingCorrection, assessment.id) or session.get(DecisionRecord, assessment.id)
-                review = session.get(Adjudication, assessment.id)
-                replacement = session.get(InvestigationRevision, assessment.id)
-                retryable = can_reprocess(assessment, adjudicated=review is not None)
-                if replacement and (retryable or actor.role == "user"):
-                    continue
+            query = (select(Assessment, Claim, FraudRoutingCorrection, DecisionRecord, Adjudication, InvestigationRevision)
+                     .join(Claim, Claim.id == Assessment.claim_id)
+                     .outerjoin(FraudRoutingCorrection, FraudRoutingCorrection.assessment_id == Assessment.id)
+                     .outerjoin(DecisionRecord, DecisionRecord.assessment_id == Assessment.id)
+                     .outerjoin(Adjudication, Adjudication.assessment_id == Assessment.id)
+                     .outerjoin(InvestigationRevision, InvestigationRevision.source_id == Assessment.id))
+            if identifier is None:
+                query = query.where(Assessment.claim_id.not_in(select(ClaimArchive.claim_id)),
+                                    InvestigationRevision.source_id.is_(None)).order_by(Claim.sequence)
+            else:
+                query = query.where(Assessment.id == identifier)
+            for assessment, claim, correction, decision, review, replacement in session.execute(query):
+                decision = correction or decision
+                retryable = can_reprocess(assessment, adjudicated=review is not None, claim=claim)
                 if retryable:
                     decision = None
-                information_requested = not review and decision and decision.payload["route"] == Route.INFO.value
+                route = decision.payload["route"] if decision else None
+                information_requested = route == Route.INFO.value
                 status = "investigation failed" if retryable or assessment.status == "failed" else "processing"
-                if review:
-                    status = review.outcome
-                elif information_requested:
-                    status = "more information requested"
-                elif decision:
-                    status = "awaiting review"
-                files = session.scalars(select(Attachment).where(Attachment.assessment_id == assessment.id)).all()
-                calls = session.scalars(select(ToolCall).where(ToolCall.assessment_id == assessment.id).order_by(ToolCall.id)).all() if actor.role != "user" else []
+                if assessment.status == "awaiting_policy":
+                    status = "awaiting processing"
+                elif route:
+                    status = route
                 reference = assessment.execution.get("original_sequence", claim.sequence)
-                rows.append({"id": assessment.id, "reference": f"CLM-{reference:04d}", "source": claim.payload.get("source", "Synthetic"),
-                             "submission": claim.payload, "received_at": claim.received_at,
-                             "status": status,
-                             "can_reprocess": retryable and not replacement and actor.role != "user",
-                             "processing_error": (assessment.error or failure_reason(assessment.context)) if retryable and actor.role != "user" else None,
-                             "processing_alerts": interrupted_attention(assessment.context, claim.payload) if retryable and actor.role != "user" else [],
-                             "reason": review.reason if review else None, "reviewed_at": review.created_at if review else None,
+                row = {"id": assessment.id, "reference": f"CLM-{reference:04d}", "source": claim.payload.get("source", "Synthetic"),
+                       "received_at": claim.received_at, "status": status}
+                if summary:
+                    rows.append({**row, "submission": {key: claim.payload.get(key) for key in ("loss_type", "gross_amount")}})
+                    continue
+                files = session.scalars(select(Attachment).where(Attachment.assessment_id == assessment.id)).all()
+                archived = identifier is not None and session.get(ClaimArchive, claim.id) is not None
+                selected_policy = assessment.context.get("selected_policy")
+                schedule = assessment.context.get("policy_schedule")
+                interrupted = retryable or assessment.status == "failed"
+                detail = {**row, "submission": claim.payload, "selected_policy": selected_policy, "archived": archived,
+                          "can_reprocess": retryable and not replacement and not archived,
+                          "attachments": [{"id": f.id, "name": f.name} for f in files]}
+                if overview:
+                    scenario = None
+                    if assessment.execution.get("generation_scenario"):
+                        original_id = assessment.id
+                        if reference != claim.sequence:
+                            original_id = session.scalar(select(Assessment.id).join(Claim).where(Claim.sequence == reference))
+                        scenario = generated_scenario_title(app.state.labels_path, original_id, store=store)
+                    rows.append({**detail, "has_policy_schedule": bool(schedule), "report_available": bool(decision or interrupted),
+                                 "replacement_id": replacement.target_id if replacement else None, "scenario_title": scenario})
+                    continue
+                calls = session.scalars(select(ToolCall).where(ToolCall.assessment_id == assessment.id).order_by(ToolCall.id)).all()
+                context = assessment.context
+                if correction:
+                    event = session.scalar(select(WorkflowEvent).where(WorkflowEvent.assessment_id == assessment.id,
+                        WorkflowEvent.kind == "evidence_routing_corrected"))
+                    if event and (handoff := event.payload.get("third_party_assessment")):
+                        coverage = context["findings"]["coverage"]
+                        coverage = {**coverage, "details": {**coverage["details"], "third_party_assessment": handoff}}
+                        context = {**context, "findings": {**context["findings"], "coverage": coverage}}
+                findings = {stage: display_finding(finding, claim.payload, selected_policy)
+                            for stage, finding in context.get("findings", {}).items()}
+                triage = ({**decision.payload, "justification": staff_justification(decision.payload, context, claim.payload)}
+                          if decision else None)
+                fraud_reason = (fraud_escalation_brief(context.get("findings", {}), claim.payload) if route == Route.FRAUD
+                                else fraud_identification_brief(findings) if route == Route.REVIEW else None)
+                rows.append({**detail, "policy_schedule": schedule,
+                             "processing_error": (assessment.error or failure_reason(assessment.context)) if interrupted else None,
+                             "processing_alerts": interrupted_attention(assessment.context, claim.payload) if interrupted else [],
                              "information_required": decision.payload.get("information_required", []) if information_requested else [],
-                             "triage": decision.payload if decision and actor.role != "user" else None,
-                             "findings": {stage: display_finding(finding, claim.payload)
-                                          for stage, finding in assessment.context.get("findings", {}).items()} if actor.role != "user" else {},
+                             "triage": triage,
+                             "findings": findings,
+                             "skipped_specialists": context.get("skipped", {}),
+                             "adjuster_review": adjuster_review_brief(claim.payload, context, decision=triage),
+                             "fraud_identification": fraud_reason,
+                             "settlement_review_reasons": settlement_review_reasons(context, triage, claim=claim.payload),
                              "investigation": {"tasks": completed_model_assignments(session, assessment),
                                                "readiness": assessment.context.get("readiness_history", {}), "plans": assessment.context.get("investigation_plans", {}), "extraction": assessment.context.get("attachment_extraction", []),
+                                               "workflow": assessment.execution.get("workflow"), "typed_plans": assessment.context.get("plans_v4", {}),
+                                               "verification": assessment.context.get("verification_rounds", {}),
                                                "tools": [{"id": c.id, "stage": c.stage, "tool": c.tool, "request": c.request, "response": c.response} for c in calls],
-                                               "replacement_id": session.get(InvestigationRevision, assessment.id).target_id if session.get(InvestigationRevision, assessment.id) else None} if actor.role != "user" else None,
-                             "attachments": [{"id": f.id, "name": f.name} for f in files]})
+                                               "replacement_id": replacement.target_id if replacement else None}})
             return list(reversed(rows))
+
+    @router.get("/portal/claims")
+    def list_claims(request: Request, summary: bool = False):
+        return portal_claim_rows(request, summary=summary)
+
+    @router.get("/portal/claims/{identifier}")
+    def claim_detail(identifier: str, request: Request, overview: bool = False):
+        rows = portal_claim_rows(request, identifier=identifier, overview=overview)
+        if not rows:
+            raise HTTPException(404, "Claim not found")
+        return rows[0]
+
+    @router.get("/portal/claims/{identifier}/investigation.pdf")
+    def investigation_pdf(identifier: str, request: Request, preview: bool = False):
+        claim = claim_detail(identifier, request)
+        if not claim["triage"] and claim["status"] != "investigation failed":
+            raise HTTPException(409, "No completed or interrupted investigation is available")
+        policy = claim["selected_policy"]
+        wording_url = str(request.url_for("preview", identifier=policy["id"])) if policy else None
+        report = render_investigation_pdf(claim, wording_url)
+        if preview:
+            return JSONResponse({"pages": pdf_page_previews(report)}, headers={"Cache-Control": "no-store"})
+        filename = f"{claim['reference']}-investigation.pdf"
+        return Response(report, media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"})
+
+    @router.get("/portal/claims/{identifier}/policy-schedule")
+    def claim_policy_schedule(identifier: str, request: Request, preview: bool = False):
+        require_staff(request)
+        with store.session() as session:
+            assessment = session.get(Assessment, identifier)
+            schedule = assessment.context.get("policy_schedule") if assessment else None
+        if not schedule:
+            raise HTTPException(404, "Policy schedule not found")
+        return JSONResponse(policy_schedule_preview(schedule) if preview else schedule, headers={"Cache-Control": "no-store"})
+
+    @router.get("/portal/vehicle-market-value")
+    def vehicle_market_value(query: Annotated[VehicleMarketQuery, Query()], request: Request):
+        require_staff(request)
+        return lookup_vehicle_market_value(query)
 
     @router.get("/portal/attachments/{attachment_id}")
     def download(attachment_id: str, request: Request):
+        require_staff(request)
         with store.session() as session:
             attachment = session.get(Attachment, attachment_id)
-            ownership = session.get(Ownership, attachment.assessment_id) if attachment else None
-            if not attachment or request.state.actor.role == "user" and (not ownership or ownership.account_id != request.state.actor.id):
+            if not attachment:
                 raise HTTPException(404, "Attachment not found")
             return Response(base64.b64decode(attachment.content), media_type="application/octet-stream",
                             headers={"Content-Disposition": 'attachment; filename="claim-document"', "X-Content-Type-Options": "nosniff"})
-
-    @router.post("/portal/claims/{identifier}/review")
-    def review_claim(identifier: str, body: Review, request: Request):
-        require_staff(request)
-        if len(body.reason.strip()) < 10:
-            raise HTTPException(422, "Provide a meaningful reason of at least 10 characters")
-        with store.session.begin() as session:
-            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
-            assessment = session.get(Assessment, identifier)
-            if assessment is None:
-                raise HTTPException(404, "Claim not found")
-            owner = session.get(Ownership, identifier)
-            if owner and owner.account_id == request.state.actor.id:
-                raise HTTPException(403, "You cannot adjudicate your own claim")
-            if session.get(Adjudication, identifier):
-                raise HTTPException(409, "A final staff decision already exists")
-            if session.get(InvestigationRevision, identifier):
-                raise HTTPException(409, "A newer investigation exists; review that assessment instead")
-            if can_reprocess(assessment) or not session.get(DecisionRecord, identifier):
-                raise HTTPException(409, "Wait for triage to finish before recording the final decision")
-            session.add(Adjudication(assessment_id=identifier, reviewer_id=request.state.actor.id, outcome=body.outcome, reason=body.reason.strip()))
-            from backend.storage.sqlite_store import HumanTask
-            task = session.scalar(select(HumanTask).where(HumanTask.assessment_id == identifier))
-            if task:
-                task.status = "reviewed"
-                task.reviewer = request.state.actor.email
-            store.add_event(session, identifier, "staff_decision", {"outcome": body.outcome, "reviewer_id": request.state.actor.id})
-        return {"status": body.outcome}
 
     app.include_router(router)
