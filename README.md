@@ -131,11 +131,14 @@ The `frontend` service serves the React app; `/api` routes to the FastAPI `backe
 service. Services and Queues are Vercel beta features. Keep Vercel Authentication
 enabled for the deployment while using the demonstration accounts.
 
-Configure `CLAIMS_STORAGE=supabase`, `SUPABASE_DATABASE_URL`, `ANTHROPIC_API_KEY`
+Configure `CLAIMS_STORAGE=supabase`, `SUPABASE_DATABASE_POOLER_URL`, `ANTHROPIC_API_KEY`
 and `OPENAI_API_KEY` in the project's server environment. Copy the existing
 Langfuse settings if tracing should continue. Set `CLAIMS_ALLOWED_ORIGINS` to any
 custom HTTPS domain; Vercel's deployment and production hostnames are allowed
 automatically. Credentials stay outside Git and the browser bundle.
+Use the IPv4 Session pooler from Supabase's Connect dialog. The pooler URL takes
+precedence over `SUPABASE_DATABASE_URL`; the direct IPv6 address does not work
+from Vercel. Enable `VERCEL_SUPPORT_LARGE_FUNCTIONS=1` for the OCR dependencies.
 
 Hosted claim investigations and policy indexing use the `ruhunu-claims-jobs`
 Vercel queue. The subscriber resumes persisted LangGraph checkpoints and takes a

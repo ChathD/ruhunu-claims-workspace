@@ -34,7 +34,7 @@ from backend.workflow.versions import selected_pdf_workflow
 
 def create_app(data_dir=None, auto_seed=False, *, database_url=None):
     if data_dir is None and os.getenv("CLAIMS_STORAGE") == "supabase":
-        database_url = database_url or os.getenv("SUPABASE_DATABASE_URL")
+        database_url = database_url or os.getenv("SUPABASE_DATABASE_POOLER_URL") or os.getenv("SUPABASE_DATABASE_URL")
         if not database_url:
             raise ValueError("Set SUPABASE_DATABASE_URL for Supabase storage.")
     data_dir = Path(data_dir or os.getenv("CLAIMS_DATA_DIR", ".local/workspace"))

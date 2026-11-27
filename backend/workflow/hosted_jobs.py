@@ -36,7 +36,7 @@ class QueueWake:
 
 @subscribe(topic=TOPIC, max_concurrency=1, retry_after=30, max_attempts=5)
 def process_job(job: dict[str, str]):
-    database_url = os.environ["SUPABASE_DATABASE_URL"]
+    database_url = os.getenv("SUPABASE_DATABASE_POOLER_URL") or os.environ["SUPABASE_DATABASE_URL"]
     data_dir = Path(os.getenv("CLAIMS_DATA_DIR", str(Path(gettempdir()) / "ruhunu-claims")))
     data_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("CLAIMS_MODEL_DIR", str(data_dir / "models"))
