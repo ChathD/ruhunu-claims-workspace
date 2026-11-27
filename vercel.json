@@ -6,8 +6,14 @@
       "framework": "fastapi",
       "entrypoint": "backend.hosting:app",
       "functions": {
-        "backend/hosting.py": { "maxDuration": 300 },
-        "backend/workflow/hosted_jobs.py": { "maxDuration": 300 }
+        "backend/hosting.py": {
+          "maxDuration": 300,
+          "excludeFiles": "{frontend/**,tests/**,docs/**,scripts/**,skills/**,.agents/**}"
+        },
+        "backend/workflow/hosted_jobs.py": {
+          "maxDuration": 300,
+          "excludeFiles": "{frontend/**,tests/**,docs/**,scripts/**,skills/**,.agents/**}"
+        }
       }
     },
     "frontend": {
