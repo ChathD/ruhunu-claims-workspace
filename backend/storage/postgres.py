@@ -1,4 +1,5 @@
 """Private PostgreSQL storage shared by the workspace and migration utility."""
+from contextlib import contextmanager
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
 
@@ -21,6 +22,22 @@ def postgres_engine(database_url):
 
 def lock_workspace(connection):
     connection.execute(text("SELECT pg_advisory_xact_lock(9032486500254246)"))
+
+
+@contextmanager
+def worker_lease(store):
+    if not store.database_url:
+        yield True
+        return
+    with store.engine.connect() as connection:
+        acquired = connection.scalar(text("SELECT pg_try_advisory_lock(9032486500254247)"))
+        connection.commit()
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                connection.execute(text("SELECT pg_advisory_unlock(9032486500254247)"))
+                connection.commit()
 
 
 def begin_write(session):

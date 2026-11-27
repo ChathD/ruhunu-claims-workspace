@@ -55,7 +55,7 @@ def create_app(data_dir=None, auto_seed=False, *, database_url=None):
                 batch_id = str(uuid.uuid4())
                 plans = plan_scheduled_claims(store, 10)
                 commit_batch(store, labels_path, preview_scheduled_batch(plans, batch_id))
-        workflow = ClaimsWorkflow(store, data_dir / "checkpoints.sqlite3")
+        workflow = None if os.getenv("VERCEL") == "1" else ClaimsWorkflow(store, data_dir / "checkpoints.sqlite3")
         worker = Worker(store, workflow)
         app.state.worker = worker
         worker.start()
@@ -63,7 +63,8 @@ def create_app(data_dir=None, auto_seed=False, *, database_url=None):
             yield
         finally:
             worker.close()
-            workflow.close()
+            if workflow is not None:
+                workflow.close()
             store.engine.dispose()
             flush_langfuse()
 
@@ -112,7 +113,7 @@ def create_app(data_dir=None, auto_seed=False, *, database_url=None):
         from backend.model_settings import settings
         enabled, model = settings()
         return {"status": "ok", "environment": "synthetic", "rules": "provisional",
-                "storage": "supabase" if store.database_url else "sqlite",
+                "storage": "supabase" if store.database_url else "sqlite", "release": os.getenv("VERCEL_GIT_COMMIT_SHA"),
                 "mode": "claude-intake-first-v3", "selected_pdf_workflow": selected_pdf_workflow(),
                 "execution_mode": "anthropic-tools" if enabled else "deterministic-tools", "model": model if enabled else None}
 

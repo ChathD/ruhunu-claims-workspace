@@ -7,10 +7,9 @@ name = "motor-claims-agent"
 version = "0.2.0"
 description = "Standalone synthetic motor claims workspace with LangGraph and React"
 requires-python = ">=3.11"
-dependencies = ["pydantic>=2.13.4,<3"]
-
-[project.optional-dependencies]
-workspace = [
+dependencies = [
+    "pydantic>=2.13.4,<3",
+    "vercel-queue==0.11.2",
     "python-dotenv>=1.0,<2",
     "pypdf>=6,<7",
     "pypdfium2>=5,<6",
@@ -38,6 +37,15 @@ workspace = [
     "langfuse==5.2.0",
     "httpx==0.28.1",
 ]
+
+[project.optional-dependencies]
+workspace = []
+
+[tool.vercel]
+entrypoint = "backend.hosting:app"
+
+[[tool.vercel.subscribers]]
+entrypoint = "backend.workflow.hosted_jobs"
 
 [project.scripts]
 claims-workspace = "backend.__main__:main"

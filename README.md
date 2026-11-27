@@ -124,6 +124,26 @@ frontend/src/
 
 Use the [backend component map](docs/ARCHITECTURE.md#backend-component-map) to find the exact files for each part of the workflow.
 
+## Deploy to Vercel
+
+Import this repository as a Services project with `vercel.json` at the repository root.
+The `frontend` service serves the React app; `/api` routes to the FastAPI `backend`
+service. Services and Queues are Vercel beta features. Keep Vercel Authentication
+enabled for the deployment while using the demonstration accounts.
+
+Configure `CLAIMS_STORAGE=supabase`, `SUPABASE_DATABASE_URL`, `ANTHROPIC_API_KEY`
+and `OPENAI_API_KEY` in the project's server environment. Copy the existing
+Langfuse settings if tracing should continue. Set `CLAIMS_ALLOWED_ORIGINS` to any
+custom HTTPS domain; Vercel's deployment and production hostnames are allowed
+automatically. Credentials stay outside Git and the browser bundle.
+
+Hosted claim investigations and policy indexing use the `ruhunu-claims-jobs`
+Vercel queue. The subscriber resumes persisted LangGraph checkpoints and takes a
+Postgres advisory lock so local and hosted workers do not process simultaneously.
+Restart a running local backend after updating to this version so it also takes
+that lock. Scratch models use `/tmp`; claims, documents and checkpoints use the
+existing private Supabase schema. `/api/health` reports the deployed Git SHA.
+
 ## Verify
 
 ```powershell

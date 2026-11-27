@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import hmac
+import os
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -92,7 +93,12 @@ def install_portal(app, store):
                     return JSONResponse({"detail": detail}, status_code=403)
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("origin")
-            if origin and origin not in {"http://127.0.0.1:5180", "http://localhost:5180", "http://127.0.0.1:8010"}:
+            allowed_origins = {"http://127.0.0.1:5180", "http://localhost:5180", "http://127.0.0.1:8010"}
+            allowed_origins.update(value.strip().rstrip("/") for value in os.getenv("CLAIMS_ALLOWED_ORIGINS", "").split(",") if value.strip())
+            for name in ("VERCEL_URL", "VERCEL_PROJECT_PRODUCTION_URL", "VERCEL_BRANCH_URL"):
+                if hostname := os.getenv(name):
+                    allowed_origins.add(f"https://{hostname}")
+            if origin and origin not in allowed_origins:
                 return JSONResponse({"detail": "Origin not allowed"}, status_code=403)
         return await call_next(request)
 
@@ -105,7 +111,7 @@ def install_portal(app, store):
             token = secrets.token_urlsafe(32)
             session.add(LoginSession(token_hash=hashlib.sha256(token.encode()).hexdigest(), account_id=account.id,
                                      expires_at=(datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()))
-            response.set_cookie("claims_session", token, httponly=True, samesite="strict", max_age=28800)
+            response.set_cookie("claims_session", token, httponly=True, secure=os.getenv("VERCEL") == "1", samesite="strict", max_age=28800)
             return {"id": account.id, "email": account.email, "role": account.role}
 
     @router.get("/auth/me")

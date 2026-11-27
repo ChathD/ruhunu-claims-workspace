@@ -15,7 +15,7 @@ from tokenizers import Tokenizer
 
 MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
 REVISION = "233902d25c440f23af6f7d6e94d2946bac0bee0a"
-MODEL_DIR = Path(__file__).resolve().parents[2] / ".local" / "models" / "policy-reranker" / REVISION
+MODEL_DIR = Path(os.getenv("CLAIMS_MODEL_DIR", Path(__file__).resolve().parents[2] / ".local" / "models")) / "policy-reranker" / REVISION
 ASSETS = {
     "tokenizer.json": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
     "onnx/model_quint8_avx2.onnx": "c80a8b34256ea453093d612e3ac48d3d965a0c0a48c7906709af8b8e28461bf9",
