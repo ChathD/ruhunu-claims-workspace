@@ -8,7 +8,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from backend.api import create_app
-from backend.storage.sqlite_store import Account, Assessment, Claim, ClaimArchive, PolicyDocument, PolicyDocumentRemoval, Store
+from backend.storage.sqlite_store import Account, Assessment, Claim, ClaimArchive, InvestigationRevision, PolicyDocument, PolicyDocumentRemoval, Store
 from backend.workflow.hosted_jobs import QueueWake
 
 
@@ -75,6 +75,12 @@ class QueueDispatchTests(unittest.TestCase):
                 resumed_key = next(call.kwargs["idempotency_key"] for call in resumed.return_value.send.call_args_list
                                    if call.args[1]["kind"] == "claim")
                 self.assertNotEqual(first_key, resumed_key)
+                with store.session.begin() as session:
+                    session.add(InvestigationRevision(source_id="a1", target_id="a3"))
+                with patch("backend.workflow.hosted_jobs.QueueClient") as replaced:
+                    QueueWake(store).set()
+                self.assertEqual([call.args[1] for call in replaced.return_value.send.call_args_list],
+                                 [{"kind": "policy", "id": "queued-policy"}])
             finally:
                 store.engine.dispose()
 

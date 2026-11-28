@@ -8,7 +8,7 @@ from vercel.queue import RetryAfter, subscribe
 from vercel.queue.sync import QueueClient
 
 from backend.storage.postgres import worker_lease
-from backend.storage.sqlite_store import Assessment, ClaimArchive, PolicyDocument, PolicyDocumentRemoval, Store
+from backend.storage.sqlite_store import Assessment, ClaimArchive, InvestigationRevision, PolicyDocument, PolicyDocumentRemoval, Store
 
 TOPIC = "ruhunu-claims-jobs"
 
@@ -23,6 +23,7 @@ class QueueWake:
             claims = session.execute(select(Assessment.id, Assessment.version).where(
                 Assessment.status.in_(["queued", "processing"]),
                 Assessment.claim_id.not_in(select(ClaimArchive.claim_id)),
+                Assessment.id.not_in(select(InvestigationRevision.source_id)),
             )).all()
             documents = session.scalars(select(PolicyDocument.id).where(
                 PolicyDocument.status.in_(["queued", "indexing"]),
@@ -34,7 +35,7 @@ class QueueWake:
             self.client.send(TOPIC, {"kind": "claim", "id": identifier}, idempotency_key=f"claim:{identifier}:version:{version}")
 
 
-@subscribe(topic=TOPIC, max_concurrency=1, retry_after=30, max_attempts=100)
+@subscribe(topic=TOPIC, max_concurrency=5, retry_after=30, max_attempts=100)
 def process_job(job: dict[str, str]):
     database_url = os.getenv("SUPABASE_DATABASE_POOLER_URL") or os.environ["SUPABASE_DATABASE_URL"]
     data_dir = Path(os.getenv("CLAIMS_DATA_DIR", str(Path(gettempdir()) / "ruhunu-claims")))
@@ -48,7 +49,7 @@ def process_job(job: dict[str, str]):
 
     store = Store(data_dir / "claims.sqlite3", database_url=database_url)
     try:
-        with worker_lease(store) as acquired:
+        with worker_lease(store, job["id"] if job["kind"] == "claim" else None) as acquired:
             if not acquired:
                 raise RetryAfter(10)
             if job["kind"] == "policy":
@@ -60,7 +61,8 @@ def process_job(job: dict[str, str]):
             elif job["kind"] == "claim":
                 with store.session() as session:
                     assessment = session.get(Assessment, job["id"])
-                    if assessment is None or assessment.status not in {"queued", "processing"} or session.get(ClaimArchive, assessment.claim_id):
+                    if (assessment is None or assessment.status not in {"queued", "processing"}
+                            or session.get(ClaimArchive, assessment.claim_id) or session.get(InvestigationRevision, assessment.id)):
                         return
                 workflow = ClaimsWorkflow(store, data_dir / "checkpoints.sqlite3")
                 try:

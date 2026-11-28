@@ -5,7 +5,7 @@ import threading
 
 from sqlalchemy import select
 
-from backend.storage.sqlite_store import Assessment, ClaimArchive
+from backend.storage.sqlite_store import Assessment, ClaimArchive, InvestigationRevision
 from backend.storage.postgres import worker_lease
 from backend.workflow.investigation_retry import mark_failed
 
@@ -55,11 +55,14 @@ class Worker:
             pending = session.scalars(select(Assessment.id).where(
                 Assessment.status.in_(["queued", "processing"]),
                 Assessment.claim_id.not_in(select(ClaimArchive.claim_id)),
+                Assessment.id.not_in(select(InvestigationRevision.source_id)),
             )).all()
         for identifier in pending:
             if self.stop.is_set():
                 return
-            process_assessment(self.store, self.workflow, identifier)
+            with worker_lease(self.store, identifier) as acquired:
+                if acquired:
+                    process_assessment(self.store, self.workflow, identifier)
 
     def close(self):
         if self.thread is None:

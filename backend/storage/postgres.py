@@ -1,5 +1,6 @@
 """Private PostgreSQL storage shared by the workspace and migration utility."""
 from contextlib import contextmanager
+import hashlib
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
 
@@ -25,18 +26,20 @@ def lock_workspace(connection):
 
 
 @contextmanager
-def worker_lease(store):
+def worker_lease(store, identifier=None):
     if not store.database_url:
         yield True
         return
+    key = (9032486500254247 if identifier is None else
+           int.from_bytes(hashlib.sha256(f"ruhunu-claim:{identifier}".encode()).digest()[:8], "big", signed=True))
     with store.engine.connect() as connection:
-        acquired = connection.scalar(text("SELECT pg_try_advisory_lock(9032486500254247)"))
+        acquired = connection.scalar(text("SELECT pg_try_advisory_lock(:key)"), {"key": key})
         connection.commit()
         try:
             yield acquired
         finally:
             if acquired:
-                connection.execute(text("SELECT pg_advisory_unlock(9032486500254247)"))
+                connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
                 connection.commit()
 
 
