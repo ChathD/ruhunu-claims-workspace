@@ -230,6 +230,66 @@ class ScheduledRoutingTests(unittest.TestCase):
         self.assertEqual(scheduled_cost_indicators(self.claim, self.schedule), [])
 
 
+class GlassReceiptGenerationTests(unittest.TestCase):
+    def setUp(self):
+        generator = scheduled_claim_generator
+        schedule = {**contract_fixture(dict.fromkeys(WORDING, "fixture")), "id": "schedule", "policy_number": "P1", "currency": "LKR",
+                    "wording": {"document_kind": "wording"}}
+        day = date(2026, 1, 3)
+        self.plan = generator.ScheduledScenario(
+            schedule, schedule["cover"][0], "auto_approval", 17, "glass_only_damage", generator.AUTO_GLASS,
+            day, day, day, Decimal("1"), Decimal("75000"), schedule["vehicle"]["registration"],
+        )
+        self.claim = generator.ScheduledClaim(
+            insured_name=schedule["insured_name"], policy_id="P1", registration=schedule["vehicle"]["registration"],
+            loss_type="repair", motor_benefit="glass_waiver", loss_date=day, reported_date=day,
+            gross_amount="72000", additional_costs=[], narrative="Debris cracked only the windscreen; the rest of the car was undamaged.",
+        )
+
+    def test_glass_receipt_retry_identifies_the_unscoped_material_line(self):
+        calls = []
+        # Replay the production failure: a separate adhesive charge lacked its component.
+        items = [
+            {"description": "Front windscreen laminated glass supply", "amount": "58500.00"},
+            {"description": "Windscreen removal and fitting labour", "amount": "6500.00"},
+            {"description": "Urethane bonding adhesive and primer application", "amount": "4200.00"},
+            {"description": "Rain sensor recalibration after windscreen replacement", "amount": "2800.00"},
+        ]
+
+        def model(request):
+            name, prompt, output = scheduled_model_output(request)
+            calls.append(prompt)
+            output["documents"][0]["line_items"] = deepcopy(items)
+            if len(calls) == 2:
+                self.assertIn(items[2]["description"], prompt)
+                self.assertIn("Every line description, including labour and materials", prompt)
+                output["documents"][0]["line_items"][2]["description"] = "Windscreen urethane bonding adhesive and primer application"
+            return tool_response(name, output)
+
+        with httpx.Client(transport=httpx.MockTransport(model)) as client:
+            documents = scheduled_claim_generator.render_attachments(client, "fixture", self.claim, self.plan)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(documents[0].line_items[2].description, "Windscreen urethane bonding adhesive and primer application")
+        self.assertEqual(sum(item.amount for item in documents[0].line_items), self.claim.gross_amount)
+
+    def test_glass_receipt_keeps_rejecting_unrelated_repairs(self):
+        calls = []
+
+        def model(request):
+            name, prompt, output = scheduled_model_output(request)
+            calls.append(prompt)
+            output["documents"][0]["line_items"] = [
+                {"description": "Replacement windscreen glass", "amount": "60000.00"},
+                {"description": "Replace front bumper", "amount": "12000.00"},
+            ]
+            return tool_response(name, output)
+
+        with httpx.Client(transport=httpx.MockTransport(model)) as client, self.assertRaisesRegex(
+                scheduled_claim_generator.GenerationError, "Replace front bumper"):
+            scheduled_claim_generator.render_attachments(client, "fixture", self.claim, self.plan)
+        self.assertEqual(len(calls), 2)
+
+
 class ScannedWordingTests(unittest.TestCase):
     def test_liability_table_keeps_limits_with_their_rows(self):
         page = Mock()

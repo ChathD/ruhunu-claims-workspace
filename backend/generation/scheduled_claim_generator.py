@@ -529,6 +529,12 @@ def render_attachments(client, model, claim, plan):
         if claim.loss_type == "theft" and not plan.motor_benefit else
         "Itemise the charges using positive amounts. Name each actual repair or service. Do not use miscellaneous or bundled charges. The amounts must add up exactly to the printed total. "
     )
+    if plan.variant == AUTO_GLASS:
+        cost_instruction += (
+            "Charge only for the damaged windscreen and work or materials needed to repair or replace it. "
+            "Every line description, including labour and materials, must explicitly name glass, windscreen or windshield "
+            "to identify the covered component. Exclude unrelated work and vehicle cleaning. "
+        )
     prompt = (
         "Prepare fictional Sri Lankan motor claim evidence as the respective garage, valuation preparer, third party, police or independent assessor. "
         "Produce one document per entry in Document fields, in the same order. Copy each document's assigned registration exactly. "
@@ -574,9 +580,13 @@ def render_attachments(client, model, claim, plan):
             return "Itemise positive costs that sum to the printed total, which must equal the gross amount claimed."
         if plan.variant == SUBLIMIT and len({item.description.casefold() for item in cost.line_items}) < 2:
             return "Itemise at least two distinct damaged parts."
-        if plan.variant == AUTO_GLASS and any(not re.search(r"\b(?:glass|windscreen|windshield)\b", item.description, re.I)
-                                             for item in cost.line_items):
-            return "Itemise windscreen glass and services on the windscreen glass only."
+        if plan.variant == AUTO_GLASS:
+            unscoped = [item.description for item in cost.line_items
+                        if not re.search(r"\b(?:glass|windscreen|windshield)\b", item.description, re.I)]
+            if unscoped:
+                return ("Charge only for the damaged windscreen and work or materials needed to repair or replace it. "
+                        "Every line description, including labour and materials, must explicitly name glass, windscreen or windshield. "
+                        "Correct these descriptions: " + json.dumps(unscoped, ensure_ascii=False))
         if isinstance(supporting, IndependentAssessorReport):
             if not earliest <= supporting.inspection_date <= supporting.date:
                 return "Put the inspection date between the earliest issue date and the date of the assessor report."
