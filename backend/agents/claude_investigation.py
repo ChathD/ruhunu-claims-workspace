@@ -34,7 +34,7 @@ from backend.evidence.third_party_assessment import CoverageEvidenceRequest, Thi
 from backend.workflow.versions import V4
 
 CALL_LOCK = threading.Lock()
-COVERAGE_MAX_TOKENS = 3200
+COVERAGE_MAX_TOKENS = 8192
 READINESS_MAX_TOKENS = 3200
 OUTPUT_RETRY_MAX_TOKENS = 8192
 CHECK_EVIDENCE_TOOLS = {

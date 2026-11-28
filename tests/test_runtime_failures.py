@@ -20,6 +20,29 @@ from backend.workflow.routing_rules import select_route
 
 
 class RuntimeFailureTests(fixtures.AgenticFixtureTestCase):
+    def test_detailed_coverage_fits_the_initial_response_budget(self):
+        identifier = self.fixture.prepare()
+        real_client = httpx.Client
+        requests = []
+
+        def handle(request):
+            payload = json.loads(request.content)
+            requests.append(payload)
+            # The production replay needed 5359 tokens for nine coverage items and seven costs.
+            complete = payload["max_tokens"] >= 5359
+            return httpx.Response(200, json={"stop_reason": "tool_use" if complete else "max_tokens",
+                "content": [{"type": "tool_use", "name": "submit_analysis", "input": {"summary": "Checked the supplied coverage evidence."}}],
+                "usage": {"output_tokens": 5359 if complete else payload["max_tokens"]}})
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "fixture", "CLAIMS_STREAM_MODEL": "0"}), patch.object(
+                agentic.httpx, "Client", side_effect=lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs)):
+            response = agentic.call_model(self.store, identifier, "r1:coverage", "Assess the supplied coverage evidence.",
+                [{"role": "user", "content": "Fictional coverage test."}], [], {"type": "tool", "name": "submit_analysis"})
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(response["stop_reason"], "tool_use")
+        with self.store.session() as session:
+            self.assertEqual(session.scalar(select(ModelInvocation).where(ModelInvocation.assessment_id == identifier)).status, "complete")
+
     def test_old_tool_signature_reproduces_error_and_skips_judge(self):
         identifier = self.fixture.prepare(5)
         def old_build_tools(store, assessment_id, stage, context_snapshot=None, audit_stage=None):

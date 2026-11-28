@@ -844,39 +844,42 @@ class AgenticTests(unittest.TestCase):
     def test_truncated_coverage_retries_once_without_repeating_checks(self):
         identifier = self.prepare()
         real_client, real_call = httpx.Client, agentic.call_model
-        requests = []
+        requests, stages = [], []
 
         def handle(request):
             payload = json.loads(request.content)
             requests.append(payload)
-            if payload["max_tokens"] < 4096:
+            if len(requests) == 1:
                 return httpx.Response(200, json={"stop_reason": "max_tokens",
                     "content": [{"type": "text", "text": "Incomplete analysis that must stay out of the retry."}]})
-            response = self.provider(self.store, identifier, "r1:coverage", payload["system"],
+            response = self.provider(self.store, identifier, stages[-1], payload["system"],
                                      payload["messages"], payload["tools"], payload["tool_choice"])
             response["content"][0]["input"]["evidence"].append("submission:/documents/0")
             return httpx.Response(200, json=response)
 
         def provider(*args, **kwargs):
-            return real_call(*args, **kwargs) if args[2] == "r1:coverage" else self.provider(*args)
+            if args[2].endswith(":coverage"):
+                stages.append(args[2])
+                return real_call(*args, **kwargs)
+            return self.provider(*args)
 
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "fixture"}), \
              patch.object(agentic.httpx, "Client", side_effect=lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs)), \
              patch.object(agentic, "call_model", side_effect=provider):
             self.workflow.run(identifier)
 
-        self.assertEqual([request["max_tokens"] for request in requests], [3200, 8192])
+        self.assertEqual([request["max_tokens"] for request in requests], [agentic.COVERAGE_MAX_TOKENS, 8192])
         self.assertEqual(requests[1]["tool_choice"], {"type": "tool", "name": "submit_analysis"})
         self.assertEqual([tool["name"] for tool in requests[1]["tools"]], ["submit_analysis"])
         self.assertEqual(requests[0]["messages"], requests[1]["messages"])
         self.assertIn("submission:/documents/0", requests[1]["tools"][0]["input_schema"]["properties"]["evidence"]["items"]["enum"])
         with self.store.session() as session:
             calls = session.scalars(select(ModelInvocation).where(ModelInvocation.assessment_id == identifier,
-                ModelInvocation.stage == "r1:coverage").order_by(ModelInvocation.created_at)).all()
+                ModelInvocation.stage.like("%:coverage")).order_by(ModelInvocation.created_at)).all()
             self.assertEqual([call.status for call in calls], ["failed", "complete"])
             self.assertEqual(calls[0].response["stop_reason"], "max_tokens")
             checks = session.scalars(select(ToolCall).where(ToolCall.assessment_id == identifier,
-                ToolCall.stage == "r1:coverage", ToolCall.tool == "execute_checks")).all()
+                ToolCall.stage.like("%:coverage"), ToolCall.tool == "execute_checks")).all()
             self.assertEqual(len(checks), 1)
             finding = session.get(Assessment, identifier).context["findings"]["coverage"]
             self.assertEqual(finding["details"]["coverage_status"], "COVERED")
@@ -892,7 +895,7 @@ class AgenticTests(unittest.TestCase):
         omission = "The wording does not address the separate storage charges incurred while the vehicle awaited assessment. " * 2
 
         def provider(*args, **kwargs):
-            if args[2] != "r1:coverage":
+            if not args[2].endswith(":coverage"):
                 return self.provider(*args)
             coverage_requests.append((copy.deepcopy(args[4]), kwargs))
             turn = len(coverage_requests)
