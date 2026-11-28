@@ -80,12 +80,12 @@ class ClaimsWorkflow:
             self.store.add_event(session, assessment_id, "decision_published", {"route": decision["route"], "reason_codes": decision["reason_codes"]})
             return decision
 
-    def run(self, assessment_id):
+    def run(self, assessment_id, *, step=False):
         assessment = self.state(assessment_id)
         if assessment.status not in {"queued", "processing"}:
             return
         with claim_trace(self.store, assessment) as span:
-            result = self._run(assessment)
+            result = self._run(assessment, step=step)
             finished = self.state(assessment_id)
             span.summary = {"status": finished.status, "context_version": finished.version}
             if finished.status == "complete":
@@ -98,7 +98,7 @@ class ClaimsWorkflow:
                 span.error_type = "InvestigationInterrupted"
             return result
 
-    def _run(self, assessment):
+    def _run(self, assessment, *, step=False):
         assessment_id = assessment.id
         version = assessment.execution.get("workflow")
         if version not in SUPPORTED or version == V4 and not assessment.context.get("selected_policy"):
@@ -133,10 +133,10 @@ class ClaimsWorkflow:
         if version == V4:
             if not hasattr(self, "selected_pdf"):
                 self.selected_pdf = IntakeFirstWorkflow(self, verify_evidence=True)
-            return self.selected_pdf.run(assessment_id)
+            return self.selected_pdf.run(assessment_id, step=step)
         if not hasattr(self, "intake_first"):
             self.intake_first = IntakeFirstWorkflow(self)
-        return self.intake_first.run(assessment_id)
+        return self.intake_first.run(assessment_id, step=step)
 
     def close(self):
         self.connection.close()

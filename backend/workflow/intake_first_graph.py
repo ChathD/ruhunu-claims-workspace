@@ -201,7 +201,7 @@ class IntakeFirstWorkflow:
                 span.error_type = "InvestigationInterrupted"
             return {"phase": "published" if decision else "interrupted"}
 
-    def run(self, assessment_id):
+    def run(self, assessment_id, *, step=False):
         with self.store.session.begin() as session:
             row = session.get(Assessment, assessment_id)
             row.status, row.error = "processing", None
@@ -210,7 +210,11 @@ class IntakeFirstWorkflow:
         saved = self.graph.get_state(config)
         initial = None if saved.next else {"assessment_id": assessment_id, "phase": "intake", "round": 0,
                                            "tasks": {}, "snapshot": {}, "results": {}, "readiness": {}}
-        self.graph.invoke(initial, config, durability="sync")
+        self.graph.invoke(initial, config, durability="sync", interrupt_after="*" if step else None)
+        if step:
+            saved = self.graph.get_state(config)
+            if saved.next:
+                return saved.config["configurable"]["checkpoint_id"]
 
     def specialist(self, role):
         @observe_node(f"specialist.{role}", kind="agent", role=role)

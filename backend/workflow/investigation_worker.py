@@ -12,9 +12,9 @@ from backend.workflow.investigation_retry import mark_failed
 logger = logging.getLogger(__name__)
 
 
-def process_assessment(store, workflow, identifier):
+def process_assessment(store, workflow, identifier, *, step=False):
     try:
-        workflow.run(identifier)
+        return workflow.run(identifier, step=True) if step else workflow.run(identifier)
     except Exception as error:
         logger.exception("Workflow failed for %s", identifier)
         with store.session.begin() as session:

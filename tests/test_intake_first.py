@@ -1,6 +1,7 @@
 """V3 ordering, per-specialist readiness, dispatch guards and recovery."""
 import copy
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -9,6 +10,8 @@ from sqlalchemy import select
 import test_agentic as fixtures
 from backend.storage.sqlite_store import AgentRun, Assessment, Claim, DecisionRecord, ModelInvocation, ToolCall, WorkflowEvent
 from backend.workflow import specialist_readiness as readiness
+from backend.workflow.claims_workflow import ClaimsWorkflow
+from backend.workflow.hosted_jobs import process_job
 from backend.assurance.investigation_display import completed_model_assignments
 from scripts.debug_workflow import scripted_readiness
 
@@ -61,6 +64,64 @@ class IntakeFirstTests(fixtures.AgenticFixtureTestCase):
         self.assertEqual({r.stage: r.input_version for r in runs}, {"r0:intake": 0, "r1:coverage": 1, "r1:fraud": 1, "r2:historical": 2})
         self.assertEqual(row.context["readiness_history"]["1"]["specialists"]["historical"]["state"], "BLOCKED_DEPENDENCY")
         self.assertEqual(row.context["readiness_history"]["2"]["specialists"]["historical"]["state"], "READY")
+
+    def test_hosted_steps_resume_after_cold_starts_without_repeating_completed_work(self):
+        identifier = self.prepare()
+        checkpoint_path = self.store.path.parent / "checkpoints.sqlite3"
+        # Use a new workflow/checkpointer for each delivery, as the hosted subscriber does.
+        tokens = []
+        with patch("backend.agents.claude_investigation.call_model", side_effect=self.fixture.provider):
+            for _ in range(25):
+                workflow = ClaimsWorkflow(self.store, checkpoint_path)
+                try:
+                    token = workflow.run(identifier, step=True)
+                finally:
+                    workflow.close()
+                if not token:
+                    break
+                self.assertNotIn(token, tokens)
+                tokens.append(token)
+            else:
+                self.fail("Checkpointed investigation did not finish")
+        self.assertGreater(len(tokens), 5)
+        with self.store.session() as session:
+            self.assertEqual(session.get(Assessment, identifier).status, "complete")
+            self.assertEqual(session.get(DecisionRecord, identifier).payload["route"], "auto-approve")
+            stages = session.scalars(select(AgentRun.stage).where(AgentRun.assessment_id == identifier)).all()
+            self.assertCountEqual([stage.partition(":")[2] for stage in stages], ["intake", "coverage", "fraud", "historical"])
+            publications = session.scalars(select(WorkflowEvent).where(
+                WorkflowEvent.assessment_id == identifier, WorkflowEvent.kind == "decision_published")).all()
+            self.assertEqual(len(publications), 1)
+
+    def test_hosted_subscriber_continues_each_checkpoint_until_publication(self):
+        identifier = self.prepare()
+        job = {"kind": "claim", "id": identifier}
+        tokens = set()
+        with patch.dict(os.environ, {"SUPABASE_DATABASE_URL": "fixture", "CLAIMS_DATA_DIR": str(self.store.path.parent)}), patch(
+                "backend.workflow.hosted_jobs.Store", return_value=self.store), patch(
+                "backend.workflow.hosted_jobs.QueueClient") as publisher, patch(
+                "backend.agents.claude_investigation.call_model", side_effect=self.fixture.provider):
+            for _ in range(25):
+                publisher.return_value.send.reset_mock()
+                process_job(job)
+                sent = publisher.return_value.send.call_args_list
+                if not sent:
+                    break
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0].args, ("ruhunu-claims-jobs", job))
+                key = sent[0].kwargs["idempotency_key"]
+                self.assertTrue(key.startswith(f"claim:{identifier}:"))
+                self.assertNotIn(key, tokens)
+                tokens.add(key)
+            else:
+                self.fail("Hosted continuation chain did not finish")
+            self.assertGreater(len(tokens), 5)
+            with self.store.session() as session:
+                self.assertEqual(session.get(Assessment, identifier).status, "complete")
+            # Redelivery of the original job must leave the published decision alone.
+            publisher.return_value.send.reset_mock()
+            process_job(job)
+            publisher.return_value.send.assert_not_called()
 
     def test_missing_loss_date_blocks_coverage_but_runs_fraud(self):
         _, row, decision, _ = self.run_case(4)

@@ -64,7 +64,10 @@ def process_job(job: dict[str, str]):
                         return
                 workflow = ClaimsWorkflow(store, data_dir / "checkpoints.sqlite3")
                 try:
-                    process_assessment(store, workflow, job["id"])
+                    checkpoint = process_assessment(store, workflow, job["id"], step=True)
+                    if checkpoint:
+                        QueueClient(region="iad1").send(TOPIC, job,
+                            idempotency_key=f"claim:{job['id']}:{checkpoint}")
                 finally:
                     workflow.close()
             else:
