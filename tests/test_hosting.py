@@ -66,6 +66,15 @@ class QueueDispatchTests(unittest.TestCase):
                     QueueWake(store).set()
                 payloads = [call.args[1] for call in publisher.return_value.send.call_args_list]
                 self.assertCountEqual(payloads, [{"kind": "claim", "id": "a1"}, {"kind": "policy", "id": "queued-policy"}])
+                first_key = next(call.kwargs["idempotency_key"] for call in publisher.return_value.send.call_args_list
+                                 if call.args[1]["kind"] == "claim")
+                with store.session.begin() as session:
+                    session.get(Assessment, "a1").version += 1
+                with patch("backend.workflow.hosted_jobs.QueueClient") as resumed:
+                    QueueWake(store).set()
+                resumed_key = next(call.kwargs["idempotency_key"] for call in resumed.return_value.send.call_args_list
+                                   if call.args[1]["kind"] == "claim")
+                self.assertNotEqual(first_key, resumed_key)
             finally:
                 store.engine.dispose()
 

@@ -20,7 +20,7 @@ class QueueWake:
 
     def set(self):
         with self.store.session() as session:
-            claims = session.scalars(select(Assessment.id).where(
+            claims = session.execute(select(Assessment.id, Assessment.version).where(
                 Assessment.status.in_(["queued", "processing"]),
                 Assessment.claim_id.not_in(select(ClaimArchive.claim_id)),
             )).all()
@@ -30,11 +30,11 @@ class QueueWake:
             )).all()
         for identifier in documents:
             self.client.send(TOPIC, {"kind": "policy", "id": identifier})
-        for identifier in claims:
-            self.client.send(TOPIC, {"kind": "claim", "id": identifier}, idempotency_key=f"claim:{identifier}")
+        for identifier, version in claims:
+            self.client.send(TOPIC, {"kind": "claim", "id": identifier}, idempotency_key=f"claim:{identifier}:version:{version}")
 
 
-@subscribe(topic=TOPIC, max_concurrency=1, retry_after=30, max_attempts=5)
+@subscribe(topic=TOPIC, max_concurrency=1, retry_after=30, max_attempts=100)
 def process_job(job: dict[str, str]):
     database_url = os.getenv("SUPABASE_DATABASE_POOLER_URL") or os.environ["SUPABASE_DATABASE_URL"]
     data_dir = Path(os.getenv("CLAIMS_DATA_DIR", str(Path(gettempdir()) / "ruhunu-claims")))
